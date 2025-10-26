@@ -1,3 +1,4 @@
+import jax
 import jax.numpy as jnp
 
 __all__ = ["pad_to_30", "compute_valid_mask", "shift_grid_to_origin"]
@@ -47,59 +48,24 @@ def shift_grid_to_origin(
     col_offset: int,
     grid_size: int,
     empty_value: int = -1,
-    background_color: int = 0
+    background_color: int = 0,
 ) -> jnp.ndarray:
     """Shift grid so that (row_offset, col_offset) becomes (0, 0).
-    
-    Cells that were -1 (padding) will be replaced with background_color.
-    New padding areas created by the shift are filled with background_color.
-    
-    Parameters
-    ----------
-    grid : jnp.ndarray
-        The grid to shift (grid_size × grid_size)
-    row_offset : int
-        Row position that should move to row 0
-    col_offset : int
-        Col position that should move to col 0
-    grid_size : int
-        Size of the grid (assumes square)
-    empty_value : int
-        Sentinel value for empty cells (default: -1)
-    background_color : int
-        Color to use for padding after shift (default: 0)
-    
-    Returns
-    -------
-    jnp.ndarray
-        Shifted grid with new padding
+
+    This version is fully JIT-friendly:
+    - Replaces EMPTY cells with background in the source
+    - Writes the source into a larger padded canvas at a *static* position
+    - Takes a `dynamic_slice` window of static size (grid_size, grid_size)
     """
-    # Replace -1 with background color in the original grid
-    grid_with_bg = jnp.where(grid == empty_value, background_color, grid)
-    
-    # Create coordinate arrays for source positions
-    rows = jnp.arange(grid_size)
-    cols = jnp.arange(grid_size)
-    
-    # Calculate source positions (where to read from)
-    src_rows = rows + row_offset
-    src_cols = cols + col_offset
-    
-    # Create meshgrid for indexing
-    src_row_grid, src_col_grid = jnp.meshgrid(src_rows, src_cols, indexing='ij')
-    
-    # Check which positions are valid (within bounds of original grid)
-    valid = (src_row_grid >= 0) & (src_row_grid < grid_size) & \
-            (src_col_grid >= 0) & (src_col_grid < grid_size)
-    
-    # Clip indices to valid range for safe indexing
-    src_row_grid_safe = jnp.clip(src_row_grid, 0, grid_size - 1)
-    src_col_grid_safe = jnp.clip(src_col_grid, 0, grid_size - 1)
-    
-    # Gather values from source positions
-    shifted = grid_with_bg[src_row_grid_safe, src_col_grid_safe]
-    
-    # Fill invalid positions (out of bounds) with background color
-    shifted = jnp.where(valid, shifted, background_color)
-    
-    return shifted 
+    grid_bg = jnp.where(grid == empty_value, background_color, grid)
+
+    big = jnp.full((grid_size * 2, grid_size * 2), background_color, dtype=grid.dtype)
+
+    insert_r = grid_size - row_offset
+    insert_c = grid_size - col_offset
+    big = jax.lax.dynamic_update_slice(big, grid_bg, (insert_r, insert_c))
+
+    start_r = grid_size
+    start_c = grid_size
+
+    return jax.lax.dynamic_slice(big, (start_r, start_c), (grid_size, grid_size))

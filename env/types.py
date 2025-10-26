@@ -29,6 +29,8 @@ class ARCEnvState:
         Input grid for current task (30, 30) int32 array
     target : jnp.ndarray
         Target output grid for current task (30, 30) int32 array
+    valid_mask : jnp.ndarray
+        Boolean mask where target != EMPTY_CELL; cached for reward/done checks
     done : jnp.ndarray
         Scalar bool indicating episode termination
     steps : jnp.ndarray
@@ -42,6 +44,7 @@ class ARCEnvState:
     cursor: jnp.ndarray
     inp: jnp.ndarray
     target: jnp.ndarray
+    valid_mask: jnp.ndarray
     done: jnp.ndarray
     steps: jnp.ndarray
     episode_idx: jnp.ndarray
@@ -54,6 +57,7 @@ class ARCEnvState:
             self.cursor,
             self.inp,
             self.target,
+            self.valid_mask,
             self.done,
             self.steps,
             self.episode_idx,

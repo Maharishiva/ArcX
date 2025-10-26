@@ -26,7 +26,6 @@ MANIFEST
 # Virtual environments
 venv/
 .venv/
-env/
 ENV/
 env.bak/
 venv.bak/
@@ -70,6 +69,9 @@ dmypy.json
 *.safetensors
 wandb/
 mlruns/
+
+# Notebooks
+notebooks/*.gif
 
 # Logs
 *.log

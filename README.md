@@ -1,6 +1,6 @@
 ## arc-agi
 
-Pure-JAX ARC environment for RL and program synthesis experiments.
+Pure-JAX ARC environment for RL and program synthesis experiments, compatible with the official [ARC-AGI-2 dataset](https://github.com/arcprize/ARC-AGI-2).
 
 ### Features
 
@@ -9,20 +9,32 @@ Pure-JAX ARC environment for RL and program synthesis experiments.
 - **Extended action space**: 18 actions including erase, crop, and shift-to-origin
 - **Batching support**: Vmapped reset and step for parallel environments
 - **Flexible observations**: Multi-channel grid observations with optional compact format
+- **Official dataset**: Includes ARC-AGI-2 with 1,000 training tasks and 120 evaluation tasks
+
+### Dataset
+
+The `data/` directory contains the official ARC-AGI-2 dataset:
+- **Training**: 1,000 tasks (3,232 train examples + 1,076 test examples) for model training
+- **Evaluation**: 120 tasks for testing (human performance: 66% average)
+
+Each task consists of demonstration input/output pairs and test cases where the goal is to produce correct outputs for all test inputs.
 
 ### Quickstart
 
 Run demos to see all actions in action:
 
 ```bash
-# Run all demos (basic, erase, crop, shift-to-origin)
-python -m scripts.run_arc_env --max_steps 100
+# Run demos with built-in sample task
+python -m scripts.run_arc_env --demo all
 
-# Run specific demo with visualization
-python -m scripts.run_arc_env --demo crop --render
+# Run on the full ARC-AGI-2 training dataset
+python -m scripts.run_arc_env --data_dir data/training --demo basic
 
-# Run on your own ARC dataset
-python -m scripts.run_arc_env --data_dir /path/to/arc/jsons --max_steps 100
+# Run on evaluation set
+python -m scripts.run_arc_env --data_dir data/evaluation --demo basic
+
+# Visualize with rendering
+python -m scripts.run_arc_env --data_dir data/training --demo shift --render
 ```
 
 ### Action Space
