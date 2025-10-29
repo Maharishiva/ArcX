@@ -42,9 +42,11 @@ def test_basic_reset_and_step():
     assert _as_bool(done) is False, "Should not be done after movement"
     assert _as_float(reward) == 0.0, "Movement should not yield reward"
 
-    state, reward, done = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT_START + 1))
+    # Choose color 1, then paint it
+    state, reward, done = env.env_step(state, jnp.array(ARCEnv.ACT_CHOOSE_COLOR_START + 1))
+    state, reward, done = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT))
     assert state.canvas[1, 0] == 1, "Should paint colour 1"
-    assert _as_float(reward) == 0.0, "Painting should not yield immediate reward"
+    assert _as_float(reward) == 0.0, "Painting should not yield immediate reward in sparse mode"
     assert _as_bool(done) is False, "Painting should not terminate"
 
     print("✓ Basic reset and step work correctly")
@@ -68,16 +70,19 @@ def test_masked_reward():
 
     # Painting the correct value in the valid region and then sending yields reward.
     state = env.env_reset(key_success, train=True)
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT_START + 2))
+    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_CHOOSE_COLOR_START + 2))
+    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT))
     state, reward, done = env.env_step(state, jnp.array(ARCEnv.ACT_SEND))
-    assert _as_float(reward) == 1.0, "Correct solution should yield reward 1"
+    # New reward: 0.5 (board match) + 1.0 (IoU) + 1.0 (full match) = 2.5 max
+    assert _as_float(reward) == 2.5, "Correct solution should yield reward 2.5"
     assert _as_bool(done) is True, "SEND should terminate"
 
     # Painting in a padded region should not affect reward when sending.
     state = env.env_reset(key_padded, train=True)
     state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_DOWN))
     state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_RIGHT))
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT_START))
+    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_CHOOSE_COLOR_START))
+    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT))
     state, reward, done = env.env_step(state, jnp.array(ARCEnv.ACT_SEND))
     assert _as_float(reward) == 0.0, "Padded-region changes should not count toward reward"
     assert _as_bool(done) is True, "SEND should terminate"
@@ -103,7 +108,7 @@ def test_send_action():
     state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_COPY))
     state, reward, done = env.env_step(state, jnp.array(ARCEnv.ACT_SEND))
     assert _as_bool(done) is True, "SEND should terminate when solved"
-    assert _as_float(reward) == 1.0, "Solved canvas should yield reward 1"
+    assert _as_float(reward) == 2.5, "Solved canvas should yield reward 2.5"
 
     print("✓ Send action works correctly")
 
@@ -131,11 +136,17 @@ def test_crop_action():
 
     state = env.env_reset(jax.random.PRNGKey(7), train=True)
 
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT_START))  # paint colour 0 at (0,0)
+    # Paint color 0 at (0,0)
+    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_CHOOSE_COLOR_START))
+    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT))
     state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_RIGHT))
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT_START + 1))
+    # Paint color 1
+    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_CHOOSE_COLOR_START + 1))
+    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT))
     state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_RIGHT))
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT_START + 2))
+    # Paint color 2
+    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_CHOOSE_COLOR_START + 2))
+    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT))
     state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_LEFT))
     state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_CROP))
 
@@ -163,7 +174,8 @@ def test_shift_to_origin():
 
     assert jnp.all(state.cursor == jnp.array([3, 5])), "Cursor should be at (3,5)"
 
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT_START + 3))
+    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_CHOOSE_COLOR_START + 3))
+    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT))
     assert state.canvas[3, 5] == 3, "Should have colour 3 at (3,5)"
 
     state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_MOVE_TO_ORIGIN))
@@ -213,7 +225,7 @@ def test_batched_operations():
     assert states.cursor.shape == (batch_size, 2), "Batched cursor should be (B, 2)"
 
     batched_step = make_batched_step(env)
-    actions = jnp.array([ARCEnv.ACT_DOWN, ARCEnv.ACT_LEFT, ARCEnv.ACT_RIGHT, ARCEnv.ACT_PAINT_START])
+    actions = jnp.array([ARCEnv.ACT_DOWN, ARCEnv.ACT_LEFT, ARCEnv.ACT_RIGHT, ARCEnv.ACT_CHOOSE_COLOR_START])
     states, rewards, dones = batched_step(states, actions)
 
     assert rewards.shape == (batch_size,), "Batched rewards should be (B,)"
@@ -276,7 +288,7 @@ def test_termination_conditions():
     state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_COPY))
     state, reward, done = env.env_step(state, jnp.array(ARCEnv.ACT_SEND))
     assert _as_bool(done) is True, "Should be done after SEND"
-    assert _as_float(reward) > 0.0, "Should get positive reward for solved SEND"
+    assert _as_float(reward) == 2.5, "Should get reward 2.5 for solved SEND"
 
     env2 = ARCEnv.from_json(sample_json, max_steps=2)
     state2 = env2.env_reset(key_budget, train=True)

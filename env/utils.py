@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 
-__all__ = ["pad_to_30", "compute_valid_mask", "shift_grid_to_origin"]
+__all__ = ["pad_to_30", "compute_valid_mask", "shift_grid_to_origin", "flood_fill_n4"]
 
 
 def pad_to_30(arr):
@@ -69,3 +69,51 @@ def shift_grid_to_origin(
     start_c = grid_size
 
     return jax.lax.dynamic_slice(big, (start_r, start_c), (grid_size, grid_size))
+
+
+def _n4(mask: jnp.ndarray) -> jnp.ndarray:
+    """4-neighborhood dilation of a boolean mask.
+
+    Returns a mask that includes up/down/left/right neighbors of True cells.
+    """
+    up = jnp.pad(mask[1:, :], ((0, 1), (0, 0)))
+    down = jnp.pad(mask[:-1, :], ((1, 0), (0, 0)))
+    left = jnp.pad(mask[:, 1:], ((0, 0), (0, 1)))
+    right = jnp.pad(mask[:, :-1], ((0, 0), (1, 0)))
+    return up | down | left | right
+
+
+@jax.jit
+def flood_fill_n4(grid: jnp.ndarray, cursor_rc: jnp.ndarray, new_color: jnp.ndarray) -> jnp.ndarray:
+    """Flood-fill from cursor using 4-neighborhood and replace with new_color.
+
+    Parameters
+    ----------
+    grid : jnp.ndarray
+        (H, W) int32 grid to be filled
+    cursor_rc : jnp.ndarray
+        (2,) int32 array [row, col] indicating seed position
+    new_color : jnp.ndarray
+        Scalar int32 color to write into the filled region
+    """
+    g = grid.astype(jnp.int32)
+    h, w = g.shape
+    r = jnp.clip(cursor_rc[0], 0, h - 1)
+    c = jnp.clip(cursor_rc[1], 0, w - 1)
+
+    target = g[r, c]
+    same = g == target
+    seed = (jnp.arange(h)[:, None] == r) & (jnp.arange(w)[None, :] == c)
+
+    def cond_fun(state):
+        visited, frontier = state
+        del visited
+        return jnp.any(frontier)
+
+    def body_fun(state):
+        visited, frontier = state
+        new_frontier = _n4(frontier) & same & ~visited
+        return visited | new_frontier, new_frontier
+
+    visited, _ = jax.lax.while_loop(cond_fun, body_fun, (seed, seed))
+    return jnp.where(visited, jnp.asarray(new_color, g.dtype), g)

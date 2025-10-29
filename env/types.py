@@ -37,6 +37,11 @@ class ARCEnvState:
         Scalar int32 counting steps taken in episode
     episode_idx : jnp.ndarray
         Scalar int32 index of current task in dataset
+    Additional fields for control and observation:
+    selected_color : jnp.ndarray
+        Scalar int32, currently selected paint color in [0, 9]
+    last_action : jnp.ndarray
+        Scalar int32, last action taken (or -1 before any action)
     """
 
     rng: jnp.ndarray
@@ -48,6 +53,8 @@ class ARCEnvState:
     done: jnp.ndarray
     steps: jnp.ndarray
     episode_idx: jnp.ndarray
+    selected_color: jnp.ndarray
+    last_action: jnp.ndarray
 
     def tree_flatten(self):
         """Flatten state for JAX pytree operations."""
@@ -61,6 +68,8 @@ class ARCEnvState:
             self.done,
             self.steps,
             self.episode_idx,
+            self.selected_color,
+            self.last_action,
         )
         return children, None
 

@@ -101,7 +101,7 @@ class PerceiverActorCritic(nn.Module):
     head_dim: int = 64
     dtype: jnp.dtype = jnp.bfloat16
 
-    policy_dim: int = 18
+    policy_dim: int = 20
     value_dim: int = 1
 
     num_cell_types: int = 16

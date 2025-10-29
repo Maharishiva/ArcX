@@ -13,16 +13,22 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 import jax
 import jax.numpy as jnp
 
-from env.data_loader import load_arc_json_file
 from env.env import ARCEnv
 from nets.PerceiverActorCritic import PerceiverActorCritic
 
 
 def _build_small_env(max_steps: int = ARCEnv.DEFAULT_MAX_STEPS) -> ARCEnv:
-    """Load a single ARC task to keep the test fast."""
-    first_task = sorted(Path("data/training").glob("*.json"))[0]
-    train_in, train_out, test_in, test_out = load_arc_json_file(first_task)
-    return ARCEnv(train_in, train_out, test_in, test_out, max_steps=max_steps)
+    """Create a minimal inline ARC task to keep the test fast and portable."""
+    sample_json = """{
+        "train": [
+            {"input": [[1,2,3],[4,5,6],[7,8,9]], "output": [[1,1,1],[2,2,2],[3,3,3]]},
+            {"input": [[0,0,0],[1,1,1],[2,2,2]], "output": [[9,9,9],[8,8,8],[7,7,7]]}
+        ],
+        "test": [
+            {"input": [[5,5,5],[6,6,6],[7,7,7]], "output": [[1,2,3],[4,5,6],[7,8,9]]}
+        ]
+    }"""
+    return ARCEnv.from_json(sample_json, max_steps=max_steps)
 
 
 def _make_model_inputs(state):
