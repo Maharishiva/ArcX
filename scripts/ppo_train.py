@@ -77,6 +77,7 @@ class PPOConfig:
     log_interval: int = 1
     checkpoint_interval: int | None = None
     checkpoint_dir: str | None = "checkpoints/ppo"
+    reward_mode: str = "sparse"
 
 
 def select_cursor_logits(canvas_logits: jnp.ndarray, cursor: jnp.ndarray, grid_size: int) -> jnp.ndarray:
@@ -487,6 +488,7 @@ def parse_args() -> tuple[PPOConfig, str]:
     parser.add_argument("--device", type=str, choices=["cpu", "cuda", "tpu", "auto"], default=None, help="Device override for JAX runtime.")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--data-dir", type=str, default=None)
+    parser.add_argument("--reward-mode", type=str, choices=["sparse", "dense"], default=None)
     parser.add_argument("--num-envs", type=int, default=None)
     parser.add_argument("--rollout-length", type=int, default=None)
     parser.add_argument("--total-updates", type=int, default=None)
@@ -550,7 +552,7 @@ def main():
     except RuntimeError:
         load_ctx = nullcontext()
     with load_ctx:
-        env = build_env_from_dir(Path(config.data_dir))
+        env = build_env_from_dir(Path(config.data_dir), reward_mode=config.reward_mode)
     grid_size = env.GRID_SIZE
     num_actions = env.NUM_ACTIONS
     max_steps = env.max_steps

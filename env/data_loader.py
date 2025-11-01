@@ -55,8 +55,11 @@ def load_arc_dir(dir_path: Path) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray,
     return _concat(train_inputs), _concat(train_outputs), _concat(test_inputs), _concat(test_outputs)
 
 
-def build_env_from_dir(dir_path: Path, max_steps: int = ARCEnv.DEFAULT_MAX_STEPS) -> ARCEnv:
+def build_env_from_dir(
+    dir_path: Path,
+    max_steps: int = ARCEnv.DEFAULT_MAX_STEPS,
+    reward_mode: str = "sparse",
+) -> ARCEnv:
     tr_in, tr_out, te_in, te_out = load_arc_dir(dir_path)
-    return ARCEnv(tr_in, tr_out, te_in, te_out, max_steps=max_steps)
-
+    return ARCEnv(tr_in, tr_out, te_in, te_out, max_steps=max_steps, reward_mode=reward_mode)
 

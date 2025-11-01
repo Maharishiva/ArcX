@@ -133,6 +133,7 @@ def parse_args():
     parser.add_argument("--fps", type=int, default=4, help="Playback FPS for the generated GIF.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for evaluation sampling.")
     parser.add_argument("--device", type=str, choices=["cpu", "cuda", "tpu", "auto"], default=None, help="Device override for JAX runtime.")
+    parser.add_argument("--reward-mode", type=str, choices=["sparse", "dense"], default="sparse", help="Reward schedule for the evaluation environment.")
     return parser.parse_args()
 
 
@@ -153,7 +154,7 @@ def main():
     active_device = args.device or _requested_device or "cpu"
     print(f"Using device preset '{active_device}' for evaluation.")
 
-    env = build_env_from_dir(Path(args.data_dir))
+    env = build_env_from_dir(Path(args.data_dir), reward_mode=args.reward_mode)
     grid_size = env.GRID_SIZE
     num_actions = env.NUM_ACTIONS
     max_steps = env.max_steps

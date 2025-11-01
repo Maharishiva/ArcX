@@ -101,6 +101,13 @@ def main():
     parser.add_argument("--max_steps", type=int, default=100)
     parser.add_argument("--render", action="store_true",
                        help="Render canvas during demos")
+    parser.add_argument(
+        "--reward_mode",
+        type=str,
+        default="sparse",
+        choices=["sparse", "dense"],
+        help="Reward schedule: sparse (terminal only) or dense (per-step).",
+    )
     parser.add_argument("--demo", type=str, default="all",
                        choices=["all", "basic", "erase", "crop", "shift"],
                        help="Which demo to run")
@@ -108,7 +115,11 @@ def main():
 
     # Build environment
     if args.data_dir:
-        env = build_env_from_dir(Path(args.data_dir), max_steps=args.max_steps)
+        env = build_env_from_dir(
+            Path(args.data_dir),
+            max_steps=args.max_steps,
+            reward_mode=args.reward_mode,
+        )
         print(f"Loaded environment from {args.data_dir}")
         print(f"  Train examples: {env.train_input.shape[0]}")
         print(f"  Test examples: {env.test_input.shape[0]}")
