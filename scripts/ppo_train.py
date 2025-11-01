@@ -542,8 +542,11 @@ def main():
     config, device_choice = parse_args()
     assert (config.num_envs * config.rollout_length) % config.num_minibatches == 0, "Minibatch size must divide rollout size"
 
-    cpu_devices = jax.devices("cpu")
-    load_ctx = jax.default_device(cpu_devices[0]) if cpu_devices else nullcontext()
+    try:
+        cpu_devices = jax.devices("cpu")
+        load_ctx = jax.default_device(cpu_devices[0]) if cpu_devices else nullcontext()
+    except RuntimeError:
+        load_ctx = nullcontext()
     with load_ctx:
         env = build_env_from_dir(Path(config.data_dir))
     grid_size = env.GRID_SIZE
