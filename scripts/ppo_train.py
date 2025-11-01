@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, NamedTuple, Tuple
 
 
-def _select_device_from_cli(default: str = "cpu") -> str:
+def _select_device_from_cli(default: str = "auto") -> str:
     if "--device" in sys.argv:
         idx = sys.argv.index("--device")
         if idx + 1 < len(sys.argv):
