@@ -7,7 +7,7 @@ import sys
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, NamedTuple, Tuple
+from typing import Dict, NamedTuple, Tuple, Optional
 
 
 def _select_device_from_cli(default: str = "auto") -> str:
@@ -78,6 +78,11 @@ class PPOConfig:
     checkpoint_interval: int | None = None
     checkpoint_dir: str | None = "checkpoints/ppo"
     reward_mode: str = "sparse"
+    wandb_project: Optional[str] = None
+    wandb_entity: Optional[str] = None
+    wandb_run_name: Optional[str] = None
+    wandb_mode: str = "disabled"
+    wandb_tags: Optional[Tuple[str, ...]] = None
 
 
 def select_cursor_logits(canvas_logits: jnp.ndarray, cursor: jnp.ndarray, grid_size: int) -> jnp.ndarray:
@@ -438,6 +443,8 @@ def evaluate_policy(
     config: PPOConfig,
     rng: jax.Array,
 ) -> Tuple[jax.Array, Dict[str, float]]:
+    empty_cell = env.EMPTY_CELL
+
     def run_split(rng_key: jax.Array, train_flag: bool):
         rng_key, reset_key = jax.random.split(rng_key)
         state = env.env_reset_batch(reset_key, train=train_flag, batch_size=config.eval_envs)
@@ -451,11 +458,36 @@ def evaluate_policy(
             if bool(jnp.all(dones)):
                 break
 
+        canvas = state.canvas
+        target = state.target
+        valid_mask = state.valid_mask
+        done_mask = state.done.astype(jnp.float32)
+        success = jnp.all(canvas == target, axis=(1, 2))
+        success_mask = success.astype(jnp.float32)
+
+        steps_float = state.steps.astype(jnp.float32)
+        solved_steps_total = jnp.sum(steps_float * done_mask)
+        done_count = jnp.sum(done_mask)
+        mean_solution_steps = jnp.where(done_count > 0.0, solved_steps_total / done_count, 0.0)
+
+        canvas_mask = canvas != empty_cell
+        intersection = jnp.sum((canvas_mask & valid_mask).astype(jnp.float32), axis=(1, 2))
+        union = jnp.sum((canvas_mask | valid_mask).astype(jnp.float32), axis=(1, 2))
+        iou = jnp.where(union > 0.0, intersection / union, jnp.ones_like(union))
+
+        valid_correct = jnp.where(valid_mask, canvas == target, True)
+        valid_accuracy = jnp.mean(valid_correct.astype(jnp.float32))
+
         metrics = {
             "return": float(jnp.mean(returns)),
+            "return_std": float(jnp.std(returns)),
             "max_return": float(jnp.max(returns)),
             "done_rate": float(jnp.mean(state.done.astype(jnp.float32))),
             "mean_steps": float(jnp.mean(state.steps.astype(jnp.float32))),
+            "mean_solution_steps": float(mean_solution_steps),
+            "success_rate": float(jnp.mean(success_mask)),
+            "mean_iou": float(jnp.mean(iou)),
+            "valid_accuracy": float(valid_accuracy),
         }
         return rng_key, metrics
 
@@ -507,6 +539,11 @@ def parse_args() -> tuple[PPOConfig, str]:
     parser.add_argument("--log-interval", type=int, default=None)
     parser.add_argument("--checkpoint-interval", type=int, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
+    parser.add_argument("--wandb-project", type=str, default=None)
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument("--wandb-mode", type=str, choices=["disabled", "online", "offline"], default=None)
+    parser.add_argument("--wandb-tags", type=str, default=None, help="Comma-separated list of tags for wandb runs.")
     args = parser.parse_args()
 
     config = PPOConfig()
@@ -527,13 +564,25 @@ def parse_args() -> tuple[PPOConfig, str]:
         )
 
     field_names = {field.name for field in dataclasses.fields(PPOConfig)}
+    wandb_tags_parsed: Optional[Tuple[str, ...]] = None
+    if args.wandb_tags:
+        tags = [tag.strip() for tag in args.wandb_tags.split(",")]
+        tags = [tag for tag in tags if tag]
+        if tags:
+            wandb_tags_parsed = tuple(tags)
+
     overrides = {}
     for key, value in vars(args).items():
+        if key == "wandb_tags":
+            continue
         if key in field_names and value is not None:
             overrides[key] = value
 
     if overrides:
         config = dataclasses.replace(config, **overrides)
+
+    if wandb_tags_parsed is not None:
+        config = dataclasses.replace(config, wandb_tags=wandb_tags_parsed)
 
     if config.max_grad_norm is not None and config.max_grad_norm < 0:
         config = dataclasses.replace(config, max_grad_norm=None)
@@ -544,6 +593,30 @@ def parse_args() -> tuple[PPOConfig, str]:
 
 def main():
     config, device_choice = parse_args()
+    use_wandb = config.wandb_mode != "disabled"
+    wandb_module = None
+    wandb_run = None
+    if use_wandb:
+        if not config.wandb_project:
+            raise ValueError("wandb_project must be provided when wandb logging is enabled.")
+        try:
+            import wandb as _wandb
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise ImportError("wandb is required for logging; install wandb or disable wandb logging.") from exc
+
+        wandb_module = _wandb
+        wandb_init_kwargs = {
+            "project": config.wandb_project,
+            "entity": config.wandb_entity,
+            "name": config.wandb_run_name,
+            "mode": config.wandb_mode,
+            "config": dataclasses.asdict(config),
+        }
+        if config.wandb_tags:
+            wandb_init_kwargs["tags"] = list(config.wandb_tags)
+        # Drop None values so wandb.init ignores them
+        wandb_init_kwargs = {k: v for k, v in wandb_init_kwargs.items() if v is not None}
+        wandb_run = wandb_module.init(**wandb_init_kwargs)
     assert (config.num_envs * config.rollout_length) % config.num_minibatches == 0, "Minibatch size must divide rollout size"
 
     try:
@@ -654,19 +727,73 @@ def main():
 
         if (update_idx + 1) % config.log_interval == 0:
             metrics_np = tree_util.tree_map(lambda x: float(x), metrics)
-            rollout_return = float(jnp.mean(jnp.sum(traj.rewards, axis=0)))
+            returns_per_env = jnp.sum(traj.rewards, axis=0)
+            rollout_return = float(jnp.mean(returns_per_env))
+            rollout_return_std = float(jnp.std(returns_per_env))
             value_mean = float(jnp.mean(traj.values))
+
+            done_mask = next_state.done.astype(jnp.float32)
+            train_done_rate = float(jnp.mean(done_mask))
+
+            success_bool = jnp.all(next_state.canvas == next_state.target, axis=(1, 2))
+            success_mask = jnp.logical_and(next_state.done, success_bool).astype(jnp.float32)
+            train_success_rate = float(jnp.mean(success_mask))
+
+            steps_float = next_state.steps.astype(jnp.float32)
+            avg_episode_length = float(jnp.mean(steps_float))
+            done_sum = float(jnp.sum(done_mask))
+            avg_solution_steps = float(jnp.sum(steps_float * done_mask) / done_sum) if done_sum > 0 else 0.0
+
+            canvas_mask = next_state.canvas != env.EMPTY_CELL
+            valid_mask = next_state.valid_mask
+            intersection = jnp.sum((canvas_mask & valid_mask).astype(jnp.float32), axis=(1, 2))
+            union = jnp.sum((canvas_mask | valid_mask).astype(jnp.float32), axis=(1, 2))
+            mean_iou = float(jnp.mean(jnp.where(union > 0.0, intersection / union, jnp.ones_like(union))))
+
+            valid_correct = jnp.where(valid_mask, next_state.canvas == next_state.target, True)
+            valid_accuracy = float(jnp.mean(valid_correct.astype(jnp.float32)))
+
+            log_update = update_idx + 1
             print(
-                f"[update {update_idx + 1:04d}] "
-                f"return={rollout_return:.3f} "
+                f"[update {log_update:04d}] "
+                f"return={rollout_return:.3f}±{rollout_return_std:.3f} "
                 f"loss={metrics_np['loss']:.4f} "
                 f"policy={metrics_np['policy_loss']:.4f} "
                 f"value={metrics_np['value_loss']:.4f} "
                 f"entropy={metrics_np['entropy']:.4f} "
                 f"kl={metrics_np['approx_kl']:.4f} "
                 f"clip_frac={metrics_np['clip_fraction']:.4f} "
-                f"value_mean={value_mean:.4f}"
+                f"value_mean={value_mean:.4f} "
+                f"done={train_done_rate:.3f} "
+                f"success={train_success_rate:.3f} "
+                f"steps={avg_episode_length:.2f} "
+                f"solve_steps={avg_solution_steps:.2f} "
+                f"iou={mean_iou:.3f} "
+                f"valid_acc={valid_accuracy:.3f}"
             )
+
+            if wandb_run is not None and wandb_module is not None:
+                wandb_module.log(
+                    {
+                        "train/update": log_update,
+                        "train/return_mean": rollout_return,
+                        "train/return_std": rollout_return_std,
+                        "train/loss_total": metrics_np["loss"],
+                        "train/loss_policy": metrics_np["policy_loss"],
+                        "train/loss_value": metrics_np["value_loss"],
+                        "train/entropy": metrics_np["entropy"],
+                        "train/approx_kl": metrics_np["approx_kl"],
+                        "train/clip_fraction": metrics_np["clip_fraction"],
+                        "train/value_mean": value_mean,
+                        "train/done_rate": train_done_rate,
+                        "train/success_rate": train_success_rate,
+                        "train/avg_episode_steps": avg_episode_length,
+                        "train/avg_solution_steps": avg_solution_steps,
+                        "train/mean_iou": mean_iou,
+                        "train/valid_accuracy": valid_accuracy,
+                    },
+                    step=log_update,
+                )
 
         if (update_idx + 1) % config.eval_interval == 0:
             rng, eval_metrics = evaluate_policy(
@@ -677,14 +804,28 @@ def main():
                 config,
                 rng,
             )
+            eval_step = update_idx + 1
             print(
-                f"[eval   {update_idx + 1:04d}] "
-                f"train_return={eval_metrics['train_return']:.3f} "
+                f"[eval   {eval_step:04d}] "
+                f"train_ret={eval_metrics['train_return']:.3f}±{eval_metrics['train_return_std']:.3f} "
                 f"train_done={eval_metrics['train_done_rate']:.3f} "
-                f"test_return={eval_metrics['test_return']:.3f} "
+                f"train_success={eval_metrics['train_success_rate']:.3f} "
+                f"train_steps={eval_metrics['train_mean_steps']:.2f} "
+                f"test_ret={eval_metrics['test_return']:.3f}±{eval_metrics['test_return_std']:.3f} "
                 f"test_done={eval_metrics['test_done_rate']:.3f} "
-                f"test_steps={eval_metrics['test_mean_steps']:.2f}"
+                f"test_success={eval_metrics['test_success_rate']:.3f} "
+                f"test_steps={eval_metrics['test_mean_steps']:.2f} "
+                f"test_sol_steps={eval_metrics['test_mean_solution_steps']:.2f} "
+                f"test_iou={eval_metrics['test_mean_iou']:.3f} "
+                f"test_valid_acc={eval_metrics['test_valid_accuracy']:.3f}"
             )
+
+            if wandb_run is not None and wandb_module is not None:
+                wandb_module.log(
+                    {f"eval/{k}": v for k, v in eval_metrics.items()
+                },
+                    step=eval_step,
+                )
             if ckpt_dir is not None:
                 maybe_save_checkpoint(ckpt_dir, update_idx + 1, train_state)
         
@@ -694,6 +835,9 @@ def main():
 
     if ckpt_dir is not None:
         maybe_save_checkpoint(ckpt_dir, config.total_updates, train_state)
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

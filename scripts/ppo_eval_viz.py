@@ -4,7 +4,7 @@ import argparse
 import os
 from pathlib import Path
 import sys
-from typing import List
+from typing import List, Optional
 
 def _select_device_from_cli(default: str = "cpu") -> str:
     if "--device" in sys.argv:
@@ -50,6 +50,35 @@ PALETTE = np.array(
     ],
     dtype=np.uint8,
 )
+
+
+def episode_metrics_from_state(state, empty_cell: int) -> dict:
+    canvas = np.array(state.canvas[0])
+    target = np.array(state.target[0])
+    valid_mask = np.array(state.valid_mask[0], dtype=bool)
+
+    painted_mask = canvas != empty_cell
+    intersection = np.logical_and(painted_mask, valid_mask).sum()
+    union = np.logical_or(painted_mask, valid_mask).sum()
+    iou = float(intersection / union) if union > 0 else 1.0
+
+    valid_cells = valid_mask.sum()
+    if valid_cells > 0:
+        valid_accuracy = float((canvas == target)[valid_mask].mean())
+    else:
+        valid_accuracy = 1.0
+
+    success = bool(np.array_equal(canvas, target))
+    done = bool(state.done[0])
+    steps = int(state.steps[0])
+
+    return {
+        "success": success,
+        "done": done,
+        "steps": steps,
+        "valid_accuracy": valid_accuracy,
+        "iou": iou,
+    }
 
 
 def grid_to_rgb(grid: np.ndarray) -> np.ndarray:
@@ -134,6 +163,11 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0, help="Random seed for evaluation sampling.")
     parser.add_argument("--device", type=str, choices=["cpu", "cuda", "tpu", "auto"], default=None, help="Device override for JAX runtime.")
     parser.add_argument("--reward-mode", type=str, choices=["sparse", "dense"], default="sparse", help="Reward schedule for the evaluation environment.")
+    parser.add_argument("--wandb-project", type=str, default=None, help="Weights & Biases project name. Enables logging when provided.")
+    parser.add_argument("--wandb-entity", type=str, default=None, help="Weights & Biases entity/user/organization.")
+    parser.add_argument("--wandb-run-name", type=str, default=None, help="Optional custom name for the wandb run.")
+    parser.add_argument("--wandb-mode", type=str, choices=["disabled", "online", "offline"], default="disabled", help="wandb logging mode.")
+    parser.add_argument("--wandb-tags", type=str, default=None, help="Comma-separated wandb tags.")
     return parser.parse_args()
 
 
@@ -148,6 +182,40 @@ def load_params(model: PerceiverActorCritic, checkpoint: Path):
 
 def main():
     args = parse_args()
+
+    tags = None
+    if args.wandb_tags:
+        tags = [tag.strip() for tag in args.wandb_tags.split(",") if tag.strip()]
+
+    use_wandb = args.wandb_mode != "disabled" and args.wandb_project is not None
+    wandb_run: Optional[object] = None
+    wandb_module = None
+    if use_wandb:
+        try:
+            import wandb as _wandb
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise ImportError("wandb is required for logging; install wandb or disable wandb logging.") from exc
+
+        wandb_module = _wandb
+        init_kwargs = {
+            "project": args.wandb_project,
+            "entity": args.wandb_entity,
+            "name": args.wandb_run_name,
+            "mode": args.wandb_mode,
+            "config": {
+                "checkpoint": str(args.checkpoint),
+                "data_dir": str(args.data_dir),
+                "reward_mode": args.reward_mode,
+                "num_episodes": args.num_episodes,
+                "rollout_horizon": args.rollout_horizon,
+                "fps": args.fps,
+            },
+        }
+        if tags:
+            init_kwargs["tags"] = tags
+        init_kwargs = {k: v for k, v in init_kwargs.items() if v is not None}
+        wandb_run = wandb_module.init(**init_kwargs)
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -166,6 +234,13 @@ def main():
     greedy_policy = make_greedy_policy(model, grid_size, num_actions, max_steps)
 
     rng = jax.random.PRNGKey(args.seed)
+
+    episode_returns: List[float] = []
+    episode_steps: List[int] = []
+    episode_successes: List[bool] = []
+    episode_completions: List[bool] = []
+    episode_ious: List[float] = []
+    episode_valid_acc: List[float] = []
 
     for episode in range(args.num_episodes):
         rng, reset_key = jax.random.split(rng)
@@ -187,13 +262,78 @@ def main():
                 frames.append(build_frame(state, inp_np, tgt_np, grid_size))
                 break
 
+        stats = episode_metrics_from_state(state, env.EMPTY_CELL)
+        episode_returns.append(total_reward)
+        episode_steps.append(stats["steps"])
+        episode_successes.append(stats["success"])
+        episode_completions.append(stats["done"])
+        episode_ious.append(stats["iou"])
+        episode_valid_acc.append(stats["valid_accuracy"])
+
         gif_path = output_dir / f"episode_{episode:03d}.gif"
         imageio.imwrite(gif_path, frames, loop=0, duration=1.0 / max(args.fps, 1))
         print(
             f"Episode {episode:02d}: return={total_reward:.3f} "
-            f"steps={int(state.steps[0])} "
-            f"done={bool(state.done[0])} -> saved {gif_path}"
+            f"steps={stats['steps']} "
+            f"done={stats['done']} "
+            f"success={stats['success']} "
+            f"iou={stats['iou']:.3f} "
+            f"valid_acc={stats['valid_accuracy']:.3f} -> saved {gif_path}"
         )
+
+        if wandb_run is not None and wandb_module is not None:
+            wandb_module.log(
+                {
+                    "viz/episode": episode,
+                    "viz/return": total_reward,
+                    "viz/steps": stats["steps"],
+                    "viz/done": float(stats["done"]),
+                    "viz/success": float(stats["success"]),
+                    "viz/iou": stats["iou"],
+                    "viz/valid_accuracy": stats["valid_accuracy"],
+                },
+                step=episode,
+            )
+
+    num_eps = len(episode_returns)
+    if num_eps > 0:
+        avg_return = float(np.mean(episode_returns))
+        std_return = float(np.std(episode_returns))
+        completion_rate = float(np.mean(episode_completions))
+        success_rate = float(np.mean(episode_successes))
+        avg_steps = float(np.mean(episode_steps))
+        solved_steps = [s for s, solved in zip(episode_steps, episode_successes) if solved]
+        avg_solved_steps = float(np.mean(solved_steps)) if solved_steps else 0.0
+        mean_iou = float(np.mean(episode_ious))
+        mean_valid_acc = float(np.mean(episode_valid_acc))
+    else:
+        avg_return = std_return = completion_rate = success_rate = avg_steps = avg_solved_steps = mean_iou = mean_valid_acc = 0.0
+
+    print("\nSummary:")
+    print(f"  Episodes: {num_eps}")
+    print(f"  Avg return: {avg_return:.3f} ± {std_return:.3f}")
+    print(f"  Completion rate: {completion_rate:.3f}  Success rate: {success_rate:.3f}")
+    print(f"  Avg steps: {avg_steps:.2f}  Avg steps (solved): {avg_solved_steps:.2f}")
+    print(f"  Mean IoU: {mean_iou:.3f}  Valid accuracy: {mean_valid_acc:.3f}")
+
+    if wandb_run is not None and wandb_module is not None:
+        wandb_module.log(
+            {
+                "viz/episodes": num_eps,
+                "viz/avg_return": avg_return,
+                "viz/std_return": std_return,
+                "viz/completion_rate": completion_rate,
+                "viz/success_rate": success_rate,
+                "viz/avg_steps": avg_steps,
+                "viz/avg_solution_steps": avg_solved_steps,
+                "viz/mean_iou": mean_iou,
+                "viz/valid_accuracy": mean_valid_acc,
+            },
+            step=num_eps,
+        )
+        wandb_run.finish()
+    elif wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
