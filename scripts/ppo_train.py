@@ -75,6 +75,7 @@ class PPOConfig:
     eval_horizon: int = 128
     eval_interval: int = 10
     log_interval: int = 1
+    checkpoint_interval: int | None = None
     checkpoint_dir: str | None = "checkpoints/ppo"
 
 
@@ -502,6 +503,7 @@ def parse_args() -> tuple[PPOConfig, str]:
     parser.add_argument("--eval-horizon", type=int, default=None)
     parser.add_argument("--eval-interval", type=int, default=None)
     parser.add_argument("--log-interval", type=int, default=None)
+    parser.add_argument("--checkpoint-interval", type=int, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     args = parser.parse_args()
 
@@ -683,6 +685,10 @@ def main():
             )
             if ckpt_dir is not None:
                 maybe_save_checkpoint(ckpt_dir, update_idx + 1, train_state)
+        
+        # Optional: save checkpoints on independent interval if requested
+        if ckpt_dir is not None and config.checkpoint_interval is not None and ((update_idx + 1) % config.checkpoint_interval == 0):
+            maybe_save_checkpoint(ckpt_dir, update_idx + 1, train_state)
 
     if ckpt_dir is not None:
         maybe_save_checkpoint(ckpt_dir, config.total_updates, train_state)
