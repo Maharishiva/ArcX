@@ -542,8 +542,13 @@ def main():
     config, device_choice = parse_args()
     assert (config.num_envs * config.rollout_length) % config.num_minibatches == 0, "Minibatch size must divide rollout size"
 
-    cpu_devices = jax.devices("cpu")
-    load_ctx = jax.default_device(cpu_devices[0]) if cpu_devices else nullcontext()
+    # Try to load env on CPU to save GPU memory, but fall back if CPU is not available
+    try:
+        cpu_devices = jax.devices("cpu")
+        load_ctx = jax.default_device(cpu_devices[0]) if cpu_devices else nullcontext()
+    except RuntimeError:
+        # CPU backend not available (e.g., CUDA-only JAX on Colab)
+        load_ctx = nullcontext()
     with load_ctx:
         env = build_env_from_dir(Path(config.data_dir))
     grid_size = env.GRID_SIZE
