@@ -28,11 +28,12 @@ class GridEncoder(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
-    def __call__(self, grids: Array, grid_type_ids: Array) -> Tuple[Array, Array]:
+    def __call__(self, grids: Array, grid_type_ids: Array, extra_feats: Optional[Array] = None) -> Tuple[Array, Array]:
         """
         Args:
             grids: (B, G, H, W) ints in [-1, num_cell_types-2]
             grid_type_ids: (B, G) or (G,) integers describing split/type
+            extra_feats: optional (B, G, H, W, F) float features to fuse with tokens
         Returns:
             tokens: (B, G*H*W, latent_dim)
             pos_xy: (B, G*H*W, 2) absolute coordinates 0..grid_size-1
@@ -83,22 +84,34 @@ class GridEncoder(nn.Module):
         )(pos_feat)
 
         tokens = (cell_embed + grid_type_embed + pos_proj).astype(self.dtype)
+
+        if extra_feats is not None:
+            assert extra_feats.shape[:4] == (B, G, H, W), "Extra feats must align with grid layout"
+            extra_projector = nn.Dense(
+                self.latent_dim,
+                dtype=self.dtype,
+                kernel_init=nn.initializers.xavier_uniform(),
+                name="extra_feat_proj",
+            )
+            extra_emb = extra_projector(extra_feats.astype(self.dtype))
+            tokens = tokens + extra_emb
+
         tokens = rearrange(tokens, "b g h w c -> b (g h w) c")
         pos_xy = rearrange(coords[..., :2], "b g h w c -> b (g h w) c").astype(jnp.float32)
         return tokens, pos_xy
 
 
 class PerceiverActorCritic(nn.Module):
-    num_latents: int = 64
-    latent_dim: int = 512
-    depth: int = 6
-    decoder_layers: int = 2
-    ff_multiplier: int = 4
+    num_latents: int = 32
+    latent_dim: int = 256
+    depth: int = 4
+    decoder_layers: int = 1
+    ff_multiplier: int = 2
     dropout: float = 0.0
     token_dropout: float = 0.0
-    num_heads: int = 8
-    num_kv_heads: int = 8
-    head_dim: int = 64
+    num_heads: int = 4
+    num_kv_heads: int = 4
+    head_dim: int = 32
     dtype: jnp.dtype = jnp.bfloat16
 
     policy_dim: int = 20
@@ -111,12 +124,33 @@ class PerceiverActorCritic(nn.Module):
     input_rope_cfg: Optional[RoPEConfig] = None
     decoder_rope_cfg: Optional[RoPEConfig] = None
 
+    def setup(self):
+        self.task_grid_encoder = GridEncoder(
+            latent_dim=self.latent_dim,
+            num_cell_types=self.num_cell_types,
+            num_grid_types=self.num_grid_types,
+            dtype=self.dtype,
+        )
+        self.canvas_grid_encoder = GridEncoder(
+            latent_dim=self.latent_dim,
+            num_cell_types=self.num_cell_types,
+            num_grid_types=self.num_grid_types,
+            dtype=self.dtype,
+        )
+
+    def prepare_task_cache(self, task_grids: Array, task_grid_type_ids: Array) -> Tuple[Array, Array]:
+        """Encode demonstrations once and reuse across multiple forward passes."""
+        return self.task_grid_encoder(task_grids, task_grid_type_ids)
+
     @nn.compact
     def __call__(
         self,
         task_grids: Array,
         task_grid_type_ids: Array,
         canvas_grid: Array,
+        extra_canvas_feats: Optional[Array] = None,
+        cached_task_tokens: Optional[Array] = None,
+        cached_task_pos: Optional[Array] = None,
         deterministic: bool = True,
     ) -> Dict[str, Array]:
         """
@@ -124,19 +158,27 @@ class PerceiverActorCritic(nn.Module):
             task_grids: (B, G, 30, 30) all context grids
             task_grid_type_ids: (B, G) or (G,) identifiers (e.g. split/input-output/index)
             canvas_grid: (B, 30, 30) current canvas
+            extra_canvas_feats: optional (B, 30, 30, F) float features per canvas cell
+            cached_task_tokens: optional precomputed task tokens
+            cached_task_pos: optional precomputed task positional encodings
         """
-        B = task_grids.shape[0]
-        encoder = GridEncoder(
-            latent_dim=self.latent_dim,
-            num_cell_types=self.num_cell_types,
-            num_grid_types=self.num_grid_types,
-            dtype=self.dtype,
-            name="grid_encoder",
-        )
-        task_tokens, task_pos = encoder(task_grids, task_grid_type_ids)
+        B = canvas_grid.shape[0]
+
+        if cached_task_tokens is None or cached_task_pos is None:
+            task_tokens, task_pos = self.prepare_task_cache(task_grids, task_grid_type_ids)
+        else:
+            task_tokens, task_pos = cached_task_tokens, cached_task_pos
 
         canvas_ids = jnp.full((B, 1), self.canvas_type_id, dtype=jnp.int32)
-        canvas_tokens, canvas_pos = encoder(canvas_grid[:, None, :, :], canvas_ids)
+        extra_canvas = None
+        if extra_canvas_feats is not None:
+            extra_canvas = extra_canvas_feats[:, None, ...]
+
+        canvas_tokens, canvas_pos = self.canvas_grid_encoder(
+            canvas_grid[:, None, :, :],
+            canvas_ids,
+            extra_canvas,
+        )
         canvas_tokens = canvas_tokens.reshape(B, -1, self.latent_dim)
         canvas_pos = canvas_pos.reshape(B, -1, 2)
 
