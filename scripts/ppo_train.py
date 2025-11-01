@@ -435,6 +435,40 @@ def reset_done_envs(env, state: ARCEnvState, rng: jax.Array, batch_size: int) ->
     )
 
 
+def summarize_env_batch(env, state: ARCEnvState, episode_returns: jnp.ndarray) -> Dict[str, float]:
+    returns = jnp.asarray(episode_returns, dtype=jnp.float32)
+    steps = state.steps.astype(jnp.float32)
+    done = state.done.astype(jnp.float32)
+
+    success = jnp.all(state.canvas == state.target, axis=(1, 2)).astype(jnp.float32)
+    solved = success * done
+    solved_count = jnp.sum(done)
+    solved_steps = jnp.sum(steps * done)
+    mean_solution_steps = jnp.where(solved_count > 0.0, solved_steps / solved_count, 0.0)
+
+    canvas_mask = state.canvas != env.EMPTY_CELL
+    valid_mask = state.valid_mask
+    intersection = jnp.sum((canvas_mask & valid_mask).astype(jnp.float32), axis=(1, 2))
+    union = jnp.sum((canvas_mask | valid_mask).astype(jnp.float32), axis=(1, 2))
+    mean_iou = jnp.mean(jnp.where(union > 0.0, intersection / union, jnp.ones_like(union)))
+
+    valid_correct = jnp.where(valid_mask, state.canvas == state.target, True)
+    valid_accuracy = jnp.mean(valid_correct.astype(jnp.float32))
+
+    summary = {
+        "return_mean": jnp.mean(returns),
+        "return_std": jnp.std(returns),
+        "return_max": jnp.max(returns),
+        "done_rate": jnp.mean(done),
+        "success_rate": jnp.mean(solved),
+        "mean_steps": jnp.mean(steps),
+        "mean_solution_steps": mean_solution_steps,
+        "mean_iou": mean_iou,
+        "valid_accuracy": valid_accuracy,
+    }
+    return {k: float(v) for k, v in summary.items()}
+
+
 def evaluate_policy(
     params: Dict[str, jnp.ndarray],
     env,
@@ -443,8 +477,6 @@ def evaluate_policy(
     config: PPOConfig,
     rng: jax.Array,
 ) -> Tuple[jax.Array, Dict[str, float]]:
-    empty_cell = env.EMPTY_CELL
-
     def run_split(rng_key: jax.Array, train_flag: bool):
         rng_key, reset_key = jax.random.split(rng_key)
         state = env.env_reset_batch(reset_key, train=train_flag, batch_size=config.eval_envs)
@@ -458,47 +490,32 @@ def evaluate_policy(
             if bool(jnp.all(dones)):
                 break
 
-        canvas = state.canvas
-        target = state.target
-        valid_mask = state.valid_mask
-        done_mask = state.done.astype(jnp.float32)
-        success = jnp.all(canvas == target, axis=(1, 2))
-        success_mask = success.astype(jnp.float32)
-
-        steps_float = state.steps.astype(jnp.float32)
-        solved_steps_total = jnp.sum(steps_float * done_mask)
-        done_count = jnp.sum(done_mask)
-        mean_solution_steps = jnp.where(done_count > 0.0, solved_steps_total / done_count, 0.0)
-
-        canvas_mask = canvas != empty_cell
-        intersection = jnp.sum((canvas_mask & valid_mask).astype(jnp.float32), axis=(1, 2))
-        union = jnp.sum((canvas_mask | valid_mask).astype(jnp.float32), axis=(1, 2))
-        iou = jnp.where(union > 0.0, intersection / union, jnp.ones_like(union))
-
-        valid_correct = jnp.where(valid_mask, canvas == target, True)
-        valid_accuracy = jnp.mean(valid_correct.astype(jnp.float32))
-
-        metrics = {
-            "return": float(jnp.mean(returns)),
-            "return_std": float(jnp.std(returns)),
-            "max_return": float(jnp.max(returns)),
-            "done_rate": float(jnp.mean(state.done.astype(jnp.float32))),
-            "mean_steps": float(jnp.mean(state.steps.astype(jnp.float32))),
-            "mean_solution_steps": float(mean_solution_steps),
-            "success_rate": float(jnp.mean(success_mask)),
-            "mean_iou": float(jnp.mean(iou)),
-            "valid_accuracy": float(valid_accuracy),
-        }
+        metrics = summarize_env_batch(env, state, returns)
         return rng_key, metrics
 
     rng, train_metrics = run_split(rng, train_flag=True)
     rng, test_metrics = run_split(rng, train_flag=False)
 
-    eval_metrics = {}
-    for key, value in train_metrics.items():
-        eval_metrics[f"train_{key}"] = value
-    for key, value in test_metrics.items():
-        eval_metrics[f"test_{key}"] = value
+    eval_metrics = {
+        "train_return": train_metrics["return_mean"],
+        "train_return_std": train_metrics["return_std"],
+        "train_return_max": train_metrics["return_max"],
+        "train_done_rate": train_metrics["done_rate"],
+        "train_success_rate": train_metrics["success_rate"],
+        "train_mean_steps": train_metrics["mean_steps"],
+        "train_mean_solution_steps": train_metrics["mean_solution_steps"],
+        "train_mean_iou": train_metrics["mean_iou"],
+        "train_valid_accuracy": train_metrics["valid_accuracy"],
+        "test_return": test_metrics["return_mean"],
+        "test_return_std": test_metrics["return_std"],
+        "test_return_max": test_metrics["return_max"],
+        "test_done_rate": test_metrics["done_rate"],
+        "test_success_rate": test_metrics["success_rate"],
+        "test_mean_steps": test_metrics["mean_steps"],
+        "test_mean_solution_steps": test_metrics["mean_solution_steps"],
+        "test_mean_iou": test_metrics["mean_iou"],
+        "test_valid_accuracy": test_metrics["valid_accuracy"],
+    }
 
     return rng, eval_metrics
 
@@ -728,35 +745,13 @@ def main():
         if (update_idx + 1) % config.log_interval == 0:
             metrics_np = tree_util.tree_map(lambda x: float(x), metrics)
             returns_per_env = jnp.sum(traj.rewards, axis=0)
-            rollout_return = float(jnp.mean(returns_per_env))
-            rollout_return_std = float(jnp.std(returns_per_env))
+            summary = summarize_env_batch(env, next_state, returns_per_env)
             value_mean = float(jnp.mean(traj.values))
-
-            done_mask = next_state.done.astype(jnp.float32)
-            train_done_rate = float(jnp.mean(done_mask))
-
-            success_bool = jnp.all(next_state.canvas == next_state.target, axis=(1, 2))
-            success_mask = jnp.logical_and(next_state.done, success_bool).astype(jnp.float32)
-            train_success_rate = float(jnp.mean(success_mask))
-
-            steps_float = next_state.steps.astype(jnp.float32)
-            avg_episode_length = float(jnp.mean(steps_float))
-            done_sum = float(jnp.sum(done_mask))
-            avg_solution_steps = float(jnp.sum(steps_float * done_mask) / done_sum) if done_sum > 0 else 0.0
-
-            canvas_mask = next_state.canvas != env.EMPTY_CELL
-            valid_mask = next_state.valid_mask
-            intersection = jnp.sum((canvas_mask & valid_mask).astype(jnp.float32), axis=(1, 2))
-            union = jnp.sum((canvas_mask | valid_mask).astype(jnp.float32), axis=(1, 2))
-            mean_iou = float(jnp.mean(jnp.where(union > 0.0, intersection / union, jnp.ones_like(union))))
-
-            valid_correct = jnp.where(valid_mask, next_state.canvas == next_state.target, True)
-            valid_accuracy = float(jnp.mean(valid_correct.astype(jnp.float32)))
 
             log_update = update_idx + 1
             print(
                 f"[update {log_update:04d}] "
-                f"return={rollout_return:.3f}±{rollout_return_std:.3f} "
+                f"return={summary['return_mean']:.3f}±{summary['return_std']:.3f} "
                 f"loss={metrics_np['loss']:.4f} "
                 f"policy={metrics_np['policy_loss']:.4f} "
                 f"value={metrics_np['value_loss']:.4f} "
@@ -764,36 +759,27 @@ def main():
                 f"kl={metrics_np['approx_kl']:.4f} "
                 f"clip_frac={metrics_np['clip_fraction']:.4f} "
                 f"value_mean={value_mean:.4f} "
-                f"done={train_done_rate:.3f} "
-                f"success={train_success_rate:.3f} "
-                f"steps={avg_episode_length:.2f} "
-                f"solve_steps={avg_solution_steps:.2f} "
-                f"iou={mean_iou:.3f} "
-                f"valid_acc={valid_accuracy:.3f}"
+                f"done={summary['done_rate']:.3f} "
+                f"success={summary['success_rate']:.3f} "
+                f"steps={summary['mean_steps']:.2f} "
+                f"solve_steps={summary['mean_solution_steps']:.2f} "
+                f"iou={summary['mean_iou']:.3f} "
+                f"valid_acc={summary['valid_accuracy']:.3f}"
             )
 
             if wandb_run is not None and wandb_module is not None:
-                wandb_module.log(
-                    {
-                        "train/update": log_update,
-                        "train/return_mean": rollout_return,
-                        "train/return_std": rollout_return_std,
-                        "train/loss_total": metrics_np["loss"],
-                        "train/loss_policy": metrics_np["policy_loss"],
-                        "train/loss_value": metrics_np["value_loss"],
-                        "train/entropy": metrics_np["entropy"],
-                        "train/approx_kl": metrics_np["approx_kl"],
-                        "train/clip_fraction": metrics_np["clip_fraction"],
-                        "train/value_mean": value_mean,
-                        "train/done_rate": train_done_rate,
-                        "train/success_rate": train_success_rate,
-                        "train/avg_episode_steps": avg_episode_length,
-                        "train/avg_solution_steps": avg_solution_steps,
-                        "train/mean_iou": mean_iou,
-                        "train/valid_accuracy": valid_accuracy,
-                    },
-                    step=log_update,
-                )
+                payload = {
+                    "train/update": log_update,
+                    "train/loss_total": metrics_np["loss"],
+                    "train/loss_policy": metrics_np["policy_loss"],
+                    "train/loss_value": metrics_np["value_loss"],
+                    "train/entropy": metrics_np["entropy"],
+                    "train/approx_kl": metrics_np["approx_kl"],
+                    "train/clip_fraction": metrics_np["clip_fraction"],
+                    "train/value_mean": value_mean,
+                }
+                payload.update({f"train/{k}": v for k, v in summary.items()})
+                wandb_module.log(payload, step=log_update)
 
         if (update_idx + 1) % config.eval_interval == 0:
             rng, eval_metrics = evaluate_policy(
