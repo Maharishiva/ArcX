@@ -105,7 +105,7 @@ class PerceiverActorCritic(nn.Module):
     num_latents: int = 16
     latent_dim: int = 128
     depth: int = 2
-    decoder_layers: int = 1
+    decoder_layers: int = 2
     ff_multiplier: int = 2
     dropout: float = 0.0
     token_dropout: float = 0.0
