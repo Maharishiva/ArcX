@@ -102,15 +102,15 @@ class GridEncoder(nn.Module):
 
 
 class PerceiverActorCritic(nn.Module):
-    num_latents: int = 32
-    latent_dim: int = 256
-    depth: int = 4
+    num_latents: int = 16
+    latent_dim: int = 128
+    depth: int = 2
     decoder_layers: int = 1
     ff_multiplier: int = 2
     dropout: float = 0.0
     token_dropout: float = 0.0
-    num_heads: int = 4
-    num_kv_heads: int = 4
+    num_heads: int = 2
+    num_kv_heads: int = 2
     head_dim: int = 32
     dtype: jnp.dtype = jnp.bfloat16
 
