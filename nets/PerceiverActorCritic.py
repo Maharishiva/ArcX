@@ -145,12 +145,14 @@ class PerceiverActorCritic(nn.Module):
     @nn.compact
     def __call__(
         self,
-        task_grids: Array,
-        task_grid_type_ids: Array,
+        task_grids: Optional[Array],
+        task_grid_type_ids: Optional[Array],
         canvas_grid: Array,
         extra_canvas_feats: Optional[Array] = None,
         cached_task_tokens: Optional[Array] = None,
         cached_task_pos: Optional[Array] = None,
+        cached_task_mask: Optional[Array] = None,
+        task_mask: Optional[Array] = None,
         deterministic: bool = True,
     ) -> Dict[str, Array]:
         """
@@ -161,13 +163,21 @@ class PerceiverActorCritic(nn.Module):
             extra_canvas_feats: optional (B, 30, 30, F) float features per canvas cell
             cached_task_tokens: optional precomputed task tokens
             cached_task_pos: optional precomputed task positional encodings
+            cached_task_mask: optional attention mask for cached tokens (B, 1, 1, T)
+            task_mask: optional attention mask when computing tokens on the fly
         """
         B = canvas_grid.shape[0]
 
         if cached_task_tokens is None or cached_task_pos is None:
+            if task_grids is None or task_grid_type_ids is None:
+                raise ValueError("task_grids and task_grid_type_ids must be provided when cache is absent")
             task_tokens, task_pos = self.prepare_task_cache(task_grids, task_grid_type_ids)
         else:
             task_tokens, task_pos = cached_task_tokens, cached_task_pos
+
+        attn_mask = cached_task_mask
+        if attn_mask is None:
+            attn_mask = task_mask
 
         canvas_ids = jnp.full((B, 1), self.canvas_type_id, dtype=jnp.int32)
         extra_canvas = None
@@ -215,6 +225,7 @@ class PerceiverActorCritic(nn.Module):
                 inputs=task_tokens,
                 input_pos=task_pos,
                 deterministic=deterministic,
+                input_mask=attn_mask,
             )
 
         decoder_tokens = jnp.concatenate([latents, canvas_tokens], axis=1)
