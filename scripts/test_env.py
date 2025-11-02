@@ -71,10 +71,10 @@ def test_masked_reward():
     # Painting the correct value in the valid region and then sending yields reward.
     state = env.env_reset(key_success, train=True)
     state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_CHOOSE_COLOR_START + 2))
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT))
+    state, paint_reward, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT))
+    assert abs(_as_float(paint_reward) - 2.0) < 1e-5, "Painting correct cell should yield shaped reward"
     state, reward, done = env.env_step(state, jnp.array(ARCEnv.ACT_SEND))
-    # New reward: 0.5 (board match) + 1.0 (IoU) + 1.0 (full match) = 2.5 max
-    assert _as_float(reward) == 2.5, "Correct solution should yield reward 2.5"
+    assert _as_float(reward) == 0.0, "SEND after solving should not add extra reward"
     assert _as_bool(done) is True, "SEND should terminate"
 
     # Painting in a padded region should not affect reward when sending.
@@ -105,10 +105,11 @@ def test_send_action():
     assert _as_float(reward) == 0.0, "Incorrect canvas should yield zero reward"
 
     state = env.env_reset(key_success, train=True)
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_COPY))
+    state, reward_copy, _ = env.env_step(state, jnp.array(ARCEnv.ACT_COPY))
+    assert _as_float(reward_copy) == 0.0, "Copying baseline should not yield progress"
     state, reward, done = env.env_step(state, jnp.array(ARCEnv.ACT_SEND))
     assert _as_bool(done) is True, "SEND should terminate when solved"
-    assert _as_float(reward) == 2.5, "Solved canvas should yield reward 2.5"
+    assert _as_float(reward) == 0.0, "Final reward is emitted via progress steps"
 
     print("✓ Send action works correctly")
 
