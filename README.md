@@ -5,7 +5,8 @@ Pure-JAX ARC environment for RL and program synthesis experiments, compatible wi
 ### Features
 
 - **JAX-native**: Fully JIT-compilable step function with pytree-compatible state
-- **Rich reward system**: Compositional reward (IoU + valid-cell match + full match) with sparse/dense modes
+- **Progress-shaped rewards**: Baseline-normalized reward encouraging improvement over copying input
+- **Multi-demo context**: Perceiver cross-attention over all train pairs (up to 5) per problem
 - **Extended action space**: 20 actions including paint, flood fill, crop, and shift-to-origin
 - **Batching support**: Vmapped reset and step for parallel environments
 - **Flexible observations**: Multi-channel grid observations with cursor and action history
@@ -97,13 +98,11 @@ The environment provides **20 discrete actions** (0-19):
 
 ### Reward and Termination
 
-- **Reward**: Compositional reward with three components:
-  - Valid-cell match bonus (0.5 if all non-padded cells match target)
-  - IoU score (intersection over union of canvas and target valid regions)
-  - Full match bonus (1.0 if entire grids match exactly)
-- **Reward modes**: 
-  - `sparse` (default): reward only on send/timeout
-  - `dense`: reward on every step
+- **Reward**: Progress-shaped reward to encourage improvement over input baseline:
+  - **Score function**: `s(canvas) = 0.2 × IoU(valid-shape) + valid-accuracy + 1.0 × full-match`
+  - **Baseline**: Score computed once at reset from input grid: `baseline = s(input)`
+  - **Progress reward**: `r_t = max(s_t - baseline, 0) - max(s_{t-1} - baseline, 0)`
+  - This penalizes "just copy the input" solutions and rewards stepwise progress toward the target
 - **Termination**: Episode ends when:
   - Send action (18) is taken, OR
   - Step budget (`max_steps`) is exhausted
@@ -117,9 +116,11 @@ The environment provides **20 discrete actions** (0-19):
 - **Value head**: Single scalar value estimate from latent aggregation
 
 Key design choices:
-- Demonstration caching: encode input/target pairs once per rollout, reuse across steps
-- Cursor-targeted policy: extract action logits for the current cursor cell only
-- Full state conditioning: last action, selected color, time remaining, cursor mask
+- **Multi-demo context**: All train input/output pairs (up to 5) from each problem are encoded as context
+- **Attention masking**: Padded demo tokens are masked in cross-attention to support variable-length contexts
+- **Demonstration caching**: Encode all train pairs once per rollout, reuse across steps for efficiency
+- **Cursor-targeted policy**: Extract action logits for the current cursor cell only
+- **Full state conditioning**: Last action, selected color, time remaining, cursor mask
 
 ### Training Infrastructure
 

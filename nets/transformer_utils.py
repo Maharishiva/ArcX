@@ -256,6 +256,7 @@ class PerceiverEncoderBlock(nn.Module):
         inputs: Array,
         input_pos: Optional[Array],
         deterministic: bool,
+        input_mask: Optional[Array] = None,
     ) -> Array:
         x = RMSNorm(dtype=self.cfg.attn_cfg_cross.dtype)(latents)
         x = MultiHeadAttention(self.cfg.attn_cfg_cross, self.rope_cfg_cross, name="cross_attn")(
@@ -263,6 +264,7 @@ class PerceiverEncoderBlock(nn.Module):
             x_kv=inputs,
             q_pos=None,
             k_pos=input_pos,
+            mask=input_mask,
             deterministic=deterministic,
         )
         latents = latents + x

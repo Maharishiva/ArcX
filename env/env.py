@@ -60,6 +60,9 @@ class ARCEnv:
         test_output: jnp.ndarray,
         max_steps: int = DEFAULT_MAX_STEPS,
         reward_mode: str = "sparse",
+        train_group_starts: jnp.ndarray = None,
+        train_group_sizes: jnp.ndarray = None,
+        max_demo_pairs: int = 5,
     ):
         self.train_input = train_input
         self.train_output = train_output
@@ -67,6 +70,39 @@ class ARCEnv:
         self.test_output = test_output
         self.max_steps = int(max_steps)
         self.dense_reward = reward_mode == "dense"
+        self.max_demo_pairs = int(max_demo_pairs)
+        
+        # Problem grouping metadata for multi-pair context
+        if train_group_starts is None:
+            # Default: treat each pair as its own problem
+            self.train_group_starts = jnp.arange(train_input.shape[0], dtype=jnp.int32)
+            self.train_group_sizes = jnp.ones((train_input.shape[0],), dtype=jnp.int32)
+        else:
+            self.train_group_starts = train_group_starts
+            self.train_group_sizes = train_group_sizes
+
+    def _compute_score(self, canvas: jnp.ndarray, target: jnp.ndarray, valid_mask: jnp.ndarray) -> jnp.ndarray:
+        """Compute progress score: 0.2*IoU(valid-shape) + valid-accuracy + 1.0*(full-match).
+        
+        This is a JIT-friendly helper used for both baseline and current score computation.
+        """
+        cells_equal = canvas == target
+        
+        # Valid-region accuracy
+        valid_correct = jnp.where(valid_mask, cells_equal, True)
+        valid_accuracy = jnp.mean(valid_correct.astype(jnp.float32))
+        
+        # IoU of valid shape
+        canvas_mask = canvas != self.EMPTY_CELL
+        iou_intersection = jnp.sum((canvas_mask & valid_mask).astype(jnp.int32)).astype(jnp.float32)
+        iou_union = jnp.sum((canvas_mask | valid_mask).astype(jnp.int32)).astype(jnp.float32)
+        iou = jnp.where(iou_union > 0.0, iou_intersection / iou_union, jnp.array(1.0, dtype=jnp.float32))
+        
+        # Full match bonus
+        full_match = jnp.all(cells_equal)
+        full_match_bonus = jnp.where(full_match, jnp.array(1.0, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32))
+        
+        return 0.2 * iou + valid_accuracy + full_match_bonus
 
     @staticmethod
     def from_json(json_str: str, max_steps: int = DEFAULT_MAX_STEPS, reward_mode: str = "sparse") -> "ARCEnv":
@@ -112,6 +148,13 @@ class ARCEnv:
         cursor = jnp.array([0, 0], dtype=jnp.int32)
         valid_mask = compute_valid_mask(target, self.EMPTY_CELL)
 
+        # Compute baseline score from input grid
+        baseline_score = self._compute_score(inp, target, valid_mask)
+        # Initial canvas is empty, compute its score
+        initial_score = self._compute_score(canvas, target, valid_mask)
+        # Initial progress is max(initial_score - baseline, 0)
+        prev_progress = jnp.maximum(initial_score - baseline_score, jnp.array(0.0, dtype=jnp.float32))
+
         return ARCEnvState(
             rng=rng_next,
             canvas=canvas,
@@ -124,6 +167,8 @@ class ARCEnv:
             episode_idx=idx,
             selected_color=jnp.array(0, dtype=jnp.int32),
             last_action=jnp.array(-1, dtype=jnp.int32),
+            baseline_score=baseline_score,
+            prev_progress=prev_progress,
         )
 
     @functools.partial(jax.jit, static_argnums=(0, 3))
@@ -148,6 +193,13 @@ class ARCEnv:
         cursor = jnp.array([0, 0], dtype=jnp.int32)
         valid_mask = compute_valid_mask(target, self.EMPTY_CELL)
 
+        # Compute baseline score from input grid
+        baseline_score = self._compute_score(inp, target, valid_mask)
+        # Initial canvas is empty, compute its score
+        initial_score = self._compute_score(canvas, target, valid_mask)
+        # Initial progress is max(initial_score - baseline, 0)
+        prev_progress = jnp.maximum(initial_score - baseline_score, jnp.array(0.0, dtype=jnp.float32))
+
         return ARCEnvState(
             rng=rng_next,
             canvas=canvas,
@@ -160,6 +212,8 @@ class ARCEnv:
             episode_idx=idx,
             selected_color=jnp.array(0, dtype=jnp.int32),
             last_action=jnp.array(-1, dtype=jnp.int32),
+            baseline_score=baseline_score,
+            prev_progress=prev_progress,
         )
 
     @functools.partial(jax.jit, static_argnums=(0, 2, 3))
@@ -188,6 +242,13 @@ class ARCEnv:
         cursor = jnp.zeros((batch_size, 2), dtype=jnp.int32)
         valid_mask = compute_valid_mask(target, self.EMPTY_CELL)
 
+        # Compute baseline scores from input grids (vectorized)
+        baseline_score = jax.vmap(lambda i, t, m: self._compute_score(i, t, m))(inp, target, valid_mask)
+        # Initial canvas is empty, compute its score
+        initial_score = jax.vmap(lambda c, t, m: self._compute_score(c, t, m))(canvas, target, valid_mask)
+        # Initial progress is max(initial_score - baseline, 0)
+        prev_progress = jnp.maximum(initial_score - baseline_score, jnp.array(0.0, dtype=jnp.float32))
+
         return ARCEnvState(
             rng=per_env_rng,
             canvas=canvas,
@@ -200,6 +261,8 @@ class ARCEnv:
             episode_idx=idxs,
             selected_color=jnp.zeros((batch_size,), dtype=jnp.int32),
             last_action=jnp.full((batch_size,), -1, dtype=jnp.int32),
+            baseline_score=baseline_score,
+            prev_progress=prev_progress,
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -275,24 +338,11 @@ class ARCEnv:
             new_steps = s.steps + jnp.array(1, dtype=jnp.int32)
             hit_budget = new_steps >= jnp.array(self.max_steps, dtype=jnp.int32)
 
-            # Reward components
-            cells_equal = new_canvas == s.target
-            valid_cells_match = jnp.all(jnp.where(s.valid_mask, cells_equal, True))
-            comp_match = jnp.where(valid_cells_match, jnp.array(0.5, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32))
-
-            canvas_mask = new_canvas != self.EMPTY_CELL
-            iou_intersection = jnp.sum((canvas_mask & s.valid_mask).astype(jnp.int32)).astype(jnp.float32)
-            iou_union = jnp.sum((canvas_mask | s.valid_mask).astype(jnp.int32)).astype(jnp.float32)
-            iou = jnp.where(iou_union > 0.0, iou_intersection / iou_union, jnp.array(1.0, dtype=jnp.float32))
-
-            full_match = jnp.all(cells_equal)
-            comp_full = jnp.where(full_match, jnp.array(1.0, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32))
-
-            total_reward = comp_match + iou + comp_full
-
-            is_terminal_event = jnp.logical_or(send_mask, hit_budget)
-            dense = jnp.array(self.dense_reward)
-            reward = jnp.where(jnp.logical_or(dense, is_terminal_event), total_reward, jnp.array(0.0, dtype=jnp.float32))
+            # Progress-shaped reward: r_t = max(s_t - b, 0) - max(s_{t-1} - b, 0)
+            # s_t = 0.2*IoU(valid-shape) + valid-accuracy + 1.0*(full-match)
+            current_score = self._compute_score(new_canvas, s.target, s.valid_mask)
+            current_progress = jnp.maximum(current_score - s.baseline_score, jnp.array(0.0, dtype=jnp.float32))
+            reward = current_progress - s.prev_progress
 
             next_done = jnp.logical_or(send_mask, hit_budget)
 
@@ -308,6 +358,8 @@ class ARCEnv:
                 episode_idx=s.episode_idx,
                 selected_color=selected_color_after,
                 last_action=a,
+                baseline_score=s.baseline_score,
+                prev_progress=current_progress,
             )
             return next_state, reward, next_done
 
@@ -364,6 +416,74 @@ class ARCEnv:
         (same signature; train flag kept for symmetry with reset)
         """
         return self.train_input, self.train_output, self.test_input
+
+    @functools.partial(jax.jit, static_argnums=(0, 2))
+    def build_context_batch(
+        self, episode_idxs: jnp.ndarray, train: bool = True
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Build context grids for a batch of episodes with padding and mask.
+        
+        For each episode index, gather up to max_demo_pairs train IO pairs from that
+        episode's problem, interleave them as [in0, out0, in1, out1, ...], pad to
+        2*max_demo_pairs grids, and build a token mask marking valid grids.
+        
+        Args:
+            episode_idxs: (B,) int32 array of sampled pair indices
+            train: if True, build context from train split; else empty context
+        
+        Returns:
+            task_grids: (B, 2*K, 30, 30) int32 array of demo grids, K=max_demo_pairs
+            grid_type_ids: (B, 2*K) int32 array with type id per grid (input: 2*p, output: 2*p+1)
+            token_mask: (B, 2*K*30*30) bool array marking valid (non-padded) tokens
+        """
+        B = episode_idxs.shape[0]
+        K = self.max_demo_pairs
+        num_grids = 2 * K
+        
+        def _build_for_one(idx):
+            # Find which problem this pair belongs to
+            # Binary search to find group: group_starts[g] <= idx < group_starts[g+1]
+            num_groups = self.train_group_starts.shape[0]
+            group_idx = jnp.searchsorted(self.train_group_starts, idx, side='right') - 1
+            group_idx = jnp.clip(group_idx, 0, num_groups - 1)
+            
+            start = self.train_group_starts[group_idx]
+            size = self.train_group_sizes[group_idx]
+            actual_pairs = jnp.minimum(size, K)
+            
+            # Gather up to K pairs from this problem
+            pair_indices = start + jnp.arange(K, dtype=jnp.int32)
+            pair_indices = jnp.where(jnp.arange(K) < actual_pairs, pair_indices, 0)
+            
+            inputs_gathered = jnp.take(self.train_input, pair_indices, axis=0)
+            outputs_gathered = jnp.take(self.train_output, pair_indices, axis=0)
+            
+            # Interleave: [in0, out0, in1, out1, ...]
+            grids_interleaved = jnp.empty((num_grids, self.GRID_SIZE, self.GRID_SIZE), dtype=jnp.int32)
+            grids_interleaved = grids_interleaved.at[0::2].set(inputs_gathered)
+            grids_interleaved = grids_interleaved.at[1::2].set(outputs_gathered)
+            
+            # Build grid type IDs: input=2*p, output=2*p+1
+            type_ids = jnp.arange(num_grids, dtype=jnp.int32)
+            
+            # Build token mask: mark tokens from valid grids as True
+            # Each grid has GRID_SIZE*GRID_SIZE tokens
+            grid_mask = jnp.arange(num_grids) < (2 * actual_pairs)
+            token_mask = jnp.repeat(grid_mask, self.GRID_SIZE * self.GRID_SIZE)
+            
+            return grids_interleaved, type_ids, token_mask
+        
+        if train:
+            task_grids, grid_type_ids, token_mask = jax.vmap(_build_for_one)(episode_idxs)
+        else:
+            # Test split: return empty context (all padded)
+            task_grids = jnp.full(
+                (B, num_grids, self.GRID_SIZE, self.GRID_SIZE), self.EMPTY_CELL, dtype=jnp.int32
+            )
+            grid_type_ids = jnp.arange(num_grids, dtype=jnp.int32)[None, :].repeat(B, axis=0)
+            token_mask = jnp.zeros((B, num_grids * self.GRID_SIZE * self.GRID_SIZE), dtype=bool)
+        
+        return task_grids, grid_type_ids, token_mask
 
     def env_render(self, state: ARCEnvState, mode: str = "canvasOnly"):
         import matplotlib.pyplot as plt

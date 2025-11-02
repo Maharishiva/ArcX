@@ -42,6 +42,10 @@ class ARCEnvState:
         Scalar int32, currently selected paint color in [0, 9]
     last_action : jnp.ndarray
         Scalar int32, last action taken (or -1 before any action)
+    baseline_score : jnp.ndarray
+        Scalar float32, score of input grid vs target (for progress shaping)
+    prev_progress : jnp.ndarray
+        Scalar float32, max(score_{t-1} - baseline, 0) for computing reward delta
     """
 
     rng: jnp.ndarray
@@ -55,6 +59,8 @@ class ARCEnvState:
     episode_idx: jnp.ndarray
     selected_color: jnp.ndarray
     last_action: jnp.ndarray
+    baseline_score: jnp.ndarray
+    prev_progress: jnp.ndarray
 
     def tree_flatten(self):
         """Flatten state for JAX pytree operations."""
@@ -70,6 +76,8 @@ class ARCEnvState:
             self.episode_idx,
             self.selected_color,
             self.last_action,
+            self.baseline_score,
+            self.prev_progress,
         )
         return children, None
 

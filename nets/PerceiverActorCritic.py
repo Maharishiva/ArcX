@@ -151,6 +151,7 @@ class PerceiverActorCritic(nn.Module):
         extra_canvas_feats: Optional[Array] = None,
         cached_task_tokens: Optional[Array] = None,
         cached_task_pos: Optional[Array] = None,
+        cached_task_mask: Optional[Array] = None,
         deterministic: bool = True,
     ) -> Dict[str, Array]:
         """
@@ -161,6 +162,7 @@ class PerceiverActorCritic(nn.Module):
             extra_canvas_feats: optional (B, 30, 30, F) float features per canvas cell
             cached_task_tokens: optional precomputed task tokens
             cached_task_pos: optional precomputed task positional encodings
+            cached_task_mask: optional (B, N_tokens) bool mask marking valid task tokens
         """
         B = canvas_grid.shape[0]
 
@@ -205,6 +207,12 @@ class PerceiverActorCritic(nn.Module):
             ff_dropout=self.dropout,
         )
 
+        # Prepare attention mask if provided
+        # cached_task_mask: (B, N_tokens) -> (B, 1, 1, N_tokens) for broadcasting over heads and queries
+        attn_mask = None
+        if cached_task_mask is not None:
+            attn_mask = cached_task_mask[:, None, None, :]  # (B, 1, 1, N_tokens)
+
         for i in range(self.depth):
             latents = PerceiverEncoderBlock(
                 block_cfg,
@@ -215,6 +223,7 @@ class PerceiverActorCritic(nn.Module):
                 inputs=task_tokens,
                 input_pos=task_pos,
                 deterministic=deterministic,
+                input_mask=attn_mask,
             )
 
         decoder_tokens = jnp.concatenate([latents, canvas_tokens], axis=1)
