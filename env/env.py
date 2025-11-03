@@ -295,7 +295,7 @@ class ARCEnv:
         canvas = jnp.full((batch_size, self.GRID_SIZE, self.GRID_SIZE), self.EMPTY_CELL, dtype=jnp.int32)
         cursor = jnp.zeros((batch_size, 2), dtype=jnp.int32)
         valid_mask = compute_valid_mask(target, self.EMPTY_CELL)
-        baseline_score = jnp.array(0.0, dtype=jnp.float32)
+        baseline_score = jnp.zeros((batch_size,), dtype=jnp.float32)
         initial_progress = self._compute_score(canvas, target, valid_mask)
 
         return ARCEnvState(
