@@ -123,6 +123,7 @@ class PerceiverActorCritic(nn.Module):
 
     input_rope_cfg: Optional[RoPEConfig] = None
     decoder_rope_cfg: Optional[RoPEConfig] = None
+    use_remat: bool = False
 
     def setup(self):
         self.task_grid_encoder = GridEncoder(
@@ -215,8 +216,14 @@ class PerceiverActorCritic(nn.Module):
             ff_dropout=self.dropout,
         )
 
+        encoder_block_cls = PerceiverEncoderBlock
+        decoder_block_cls = DecoderBlock
+        if self.use_remat:
+            encoder_block_cls = nn.remat(encoder_block_cls)
+            decoder_block_cls = nn.remat(decoder_block_cls)
+
         for i in range(self.depth):
-            latents = PerceiverEncoderBlock(
+            latents = encoder_block_cls(
                 block_cfg,
                 rope_cfg_cross=self.input_rope_cfg,
                 name=f"encoder_block_{i}",
@@ -243,7 +250,7 @@ class PerceiverActorCritic(nn.Module):
         decoder_ff_hidden = self.latent_dim * self.ff_multiplier
 
         for i in range(self.decoder_layers):
-            decoder_tokens = DecoderBlock(
+            decoder_tokens = decoder_block_cls(
                 decoder_attn_cfg,
                 self.decoder_rope_cfg,
                 decoder_ff_hidden,
