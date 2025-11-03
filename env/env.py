@@ -203,9 +203,8 @@ class ARCEnv:
         canvas = jnp.full((self.GRID_SIZE, self.GRID_SIZE), self.EMPTY_CELL, dtype=jnp.int32)
         cursor = jnp.array([0, 0], dtype=jnp.int32)
         valid_mask = compute_valid_mask(target, self.EMPTY_CELL)
-        baseline_score = self._compute_score(inp, target, valid_mask)
-        empty_score = self._compute_score(canvas, target, valid_mask)
-        initial_progress = jnp.maximum(empty_score - baseline_score, 0.0)
+        baseline_score = jnp.array(0.0, dtype=jnp.float32)
+        initial_progress = self._compute_score(canvas, target, valid_mask)
 
         return ARCEnvState(
             rng=rng_next,
@@ -248,9 +247,8 @@ class ARCEnv:
         canvas = jnp.full((self.GRID_SIZE, self.GRID_SIZE), self.EMPTY_CELL, dtype=jnp.int32)
         cursor = jnp.array([0, 0], dtype=jnp.int32)
         valid_mask = compute_valid_mask(target, self.EMPTY_CELL)
-        baseline_score = self._compute_score(inp, target, valid_mask)
-        empty_score = self._compute_score(canvas, target, valid_mask)
-        initial_progress = jnp.maximum(empty_score - baseline_score, 0.0)
+        baseline_score = jnp.array(0.0, dtype=jnp.float32)
+        initial_progress = self._compute_score(canvas, target, valid_mask)
 
         return ARCEnvState(
             rng=rng_next,
@@ -297,9 +295,8 @@ class ARCEnv:
         canvas = jnp.full((batch_size, self.GRID_SIZE, self.GRID_SIZE), self.EMPTY_CELL, dtype=jnp.int32)
         cursor = jnp.zeros((batch_size, 2), dtype=jnp.int32)
         valid_mask = compute_valid_mask(target, self.EMPTY_CELL)
-        baseline_score = self._compute_score(inp, target, valid_mask)
-        empty_score = self._compute_score(canvas, target, valid_mask)
-        initial_progress = jnp.maximum(empty_score - baseline_score, 0.0)
+        baseline_score = jnp.array(0.0, dtype=jnp.float32)
+        initial_progress = self._compute_score(canvas, target, valid_mask)
 
         return ARCEnvState(
             rng=per_env_rng,
@@ -422,9 +419,9 @@ class ARCEnv:
             # Crop region to EMPTY_CELL (-1) from cursor to bottom-right
             rows = jnp.arange(self.GRID_SIZE, dtype=jnp.int32)
             cols = jnp.arange(self.GRID_SIZE, dtype=jnp.int32)
-            crop_mask_rows = rows[:, None] >= cursor_after_move[0]
-            crop_mask_cols = cols[None, :] >= cursor_after_move[1]
-            crop_region = crop_mask_rows & crop_mask_cols
+            crop_mask_rows = rows[:, None] > cursor_after_move[0]
+            crop_mask_cols = cols[None, :] > cursor_after_move[1]
+            crop_region = crop_mask_rows | crop_mask_cols
             cropped_canvas = jnp.where(crop_region, self.EMPTY_CELL, s.canvas)
 
             # Move the subgrid so that the cursor lands at (0,0), fill leftover with BACKGROUND_COLOR
@@ -448,8 +445,7 @@ class ARCEnv:
             hit_budget = new_steps >= jnp.array(self.max_steps, dtype=jnp.int32)
 
             score_new = self._compute_score(new_canvas, s.target, s.valid_mask)
-            progress_new = jnp.maximum(score_new - s.baseline_score, 0.0)
-            reward = progress_new - s.prev_progress
+            reward = score_new - s.prev_progress
 
             next_done = jnp.logical_or(send_mask, hit_budget)
 
@@ -467,7 +463,7 @@ class ARCEnv:
                 selected_color=selected_color_after,
                 last_action=a,
                 baseline_score=s.baseline_score,
-                prev_progress=progress_new,
+                prev_progress=score_new,
             )
             return next_state, reward, next_done
 

@@ -1,11 +1,19 @@
 """Comprehensive test suite for the ARC environment."""
 
 import os
+import sys
+from pathlib import Path
 
 os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 
 import jax
 import jax.numpy as jnp
+
+from dataclasses import replace
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from env import ARCEnv
 from env.wrappers import make_batched_reset, make_batched_step, observe, observe_compact
@@ -72,7 +80,7 @@ def test_masked_reward():
     state = env.env_reset(key_success, train=True)
     state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_CHOOSE_COLOR_START + 2))
     state, paint_reward, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT))
-    assert abs(_as_float(paint_reward) - 2.0) < 1e-5, "Painting correct cell should yield shaped reward"
+    assert abs(_as_float(paint_reward) - 2.2) < 1e-5, "Painting correct cell should yield shaped reward"
     state, reward, done = env.env_step(state, jnp.array(ARCEnv.ACT_SEND))
     assert _as_float(reward) == 0.0, "SEND after solving should not add extra reward"
     assert _as_bool(done) is True, "SEND should terminate"
@@ -106,7 +114,7 @@ def test_send_action():
 
     state = env.env_reset(key_success, train=True)
     state, reward_copy, _ = env.env_step(state, jnp.array(ARCEnv.ACT_COPY))
-    assert _as_float(reward_copy) == 0.0, "Copying baseline should not yield progress"
+    assert abs(_as_float(reward_copy) - 2.2) < 1e-5, "Copying baseline should yield the full score jump"
     state, reward, done = env.env_step(state, jnp.array(ARCEnv.ACT_SEND))
     assert _as_bool(done) is True, "SEND should terminate when solved"
     assert _as_float(reward) == 0.0, "Final reward is emitted via progress steps"
@@ -132,29 +140,35 @@ def test_crop_action():
     """Test crop action (action 16)."""
     print("Testing crop action...")
 
-    sample_json = '{"train": [{"input": [[1,2,3],[4,5,6]], "output": [[1,2,3],[4,5,6]]}], "test": []}'
-    env = ARCEnv.from_json(sample_json, max_steps=20)
+    env = ARCEnv.from_json('{"train": [], "test": [{"input": [[0]], "output": [[0]]}]}', max_steps=20)
 
-    state = env.env_reset(jax.random.PRNGKey(7), train=True)
+    state = env.env_reset(jax.random.PRNGKey(7), train=False)
+    base_canvas = jnp.full((env.GRID_SIZE, env.GRID_SIZE), ARCEnv.EMPTY_CELL, dtype=jnp.int32)
+    pattern = jnp.array(
+        [
+            [0, 1, 2],
+            [1, 2, 3],
+            [2, 3, 4],
+        ],
+        dtype=jnp.int32,
+    )
+    base_canvas = base_canvas.at[:3, :3].set(pattern)
+    cursor = jnp.array([1, 1], dtype=jnp.int32)
 
-    # Paint color 0 at (0,0)
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_CHOOSE_COLOR_START))
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT))
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_RIGHT))
-    # Paint color 1
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_CHOOSE_COLOR_START + 1))
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT))
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_RIGHT))
-    # Paint color 2
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_CHOOSE_COLOR_START + 2))
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT))
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_LEFT))
+    state = replace(state, canvas=base_canvas, cursor=cursor)
     state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_CROP))
 
-    assert state.canvas[0, 0] == 0, "Cell before crop point should be preserved"
-    assert state.canvas[0, 1] == ARCEnv.EMPTY_CELL, "Cell at crop point should be EMPTY"
-    assert state.canvas[0, 2] == ARCEnv.EMPTY_CELL, "Cells after crop point should be EMPTY"
-    assert state.canvas[1, 0] == ARCEnv.EMPTY_CELL, "Rows below crop should be EMPTY"
+    expected = jnp.array(
+        [
+            [0, 1, ARCEnv.EMPTY_CELL],
+            [1, 2, ARCEnv.EMPTY_CELL],
+            [ARCEnv.EMPTY_CELL, ARCEnv.EMPTY_CELL, ARCEnv.EMPTY_CELL],
+        ],
+        dtype=jnp.int32,
+    )
+
+    assert jnp.array_equal(state.canvas[:3, :3], expected), "Crop should preserve quadrant up-left of cursor"
+    assert jnp.array_equal(state.cursor, cursor), "Cursor position should remain unchanged"
 
     print("✓ Crop action works correctly")
 
