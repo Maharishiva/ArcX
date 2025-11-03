@@ -79,7 +79,7 @@ class PPOConfig:
     log_interval: int = 1
     checkpoint_interval: int | None = None
     checkpoint_dir: str | None = "checkpoints/ppo"
-    reward_mode: str = "sparse"
+    reward_mode: str = "dense"
     max_demo_pairs: int = 5
     wandb_project: Optional[str] = None
     wandb_entity: Optional[str] = None
