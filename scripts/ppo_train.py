@@ -334,82 +334,101 @@ def make_ppo_update_fn(
 ):
     batch_size = config.num_envs * config.rollout_length
     minibatch_size = batch_size // config.num_minibatches
+    if minibatch_size % config.num_envs != 0:
+        raise ValueError(
+            "num_minibatches must divide rollout_length so that each minibatch spans an integer number of timesteps per environment."
+        )
+
+    steps_per_minibatch = minibatch_size // config.num_envs
+    if steps_per_minibatch == 0:
+        raise ValueError("num_minibatches cannot exceed rollout_length when avoiding cache duplication.")
 
     def loss_fn(params, batch, cache: TaskCache):
-        env_ids = batch["env_ids"].astype(jnp.int32)
-        task_grids = cache.grids[env_ids]
-        grid_ids = cache.grid_ids[env_ids]
-        cached_tokens = cache.tokens[env_ids]
-        cached_pos = cache.pos[env_ids]
-        cached_mask = cache.mask[env_ids]
-        extra_feats = build_extra_canvas_features(
-            batch["cursor"],
-            batch["last_action"],
-            batch["selected_color"],
-            batch["steps"],
-            grid_size,
-            num_actions,
-            max_steps,
-        )
-        outputs = model_apply(
-            {"params": params},
-            task_grids,
-            grid_ids,
-            batch["canvas"],
-            extra_feats,
-            cached_task_tokens=cached_tokens,
-            cached_task_pos=cached_pos,
-            cached_task_mask=cached_mask,
-            deterministic=False,
-        )
-        cursor_logits = select_cursor_logits(outputs["logits"], batch["cursor"], grid_size)
-        log_probs_all = jax.nn.log_softmax(cursor_logits, axis=-1)
-        idx = jnp.arange(cursor_logits.shape[0])
-        new_log_probs = log_probs_all[idx, batch["actions"]]
+        metric_keys = ("loss", "policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction")
+        init_metrics = {k: jnp.zeros((), dtype=jnp.float32) for k in metric_keys}
 
-        ratios = jnp.exp(new_log_probs - batch["old_log_probs"])
-        clipped = jnp.clip(ratios, 1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon)
-        policy_loss = -jnp.mean(jnp.minimum(ratios * batch["advantages"], clipped * batch["advantages"]))
+        def timestep_loss(carry, data):
+            metrics_acc = carry
+            extra_feats = build_extra_canvas_features(
+                data["cursor"],
+                data["last_action"],
+                data["selected_color"],
+                data["steps"],
+                grid_size,
+                num_actions,
+                max_steps,
+            )
+            outputs = model_apply(
+                {"params": params},
+                cache.grids,
+                cache.grid_ids,
+                data["canvas"],
+                extra_feats,
+                cached_task_tokens=cache.tokens,
+                cached_task_pos=cache.pos,
+                cached_task_mask=cache.mask,
+                deterministic=False,
+            )
+            cursor_logits = select_cursor_logits(outputs["logits"], data["cursor"], grid_size)
+            log_probs_all = jax.nn.log_softmax(cursor_logits, axis=-1)
+            idx = jnp.arange(cursor_logits.shape[0])
+            new_log_probs = log_probs_all[idx, data["actions"]]
 
-        values = outputs["value"]
-        value_loss = 0.5 * jnp.mean((values - batch["returns"]) ** 2)
+            ratios = jnp.exp(new_log_probs - data["old_log_probs"])
+            clipped = jnp.clip(ratios, 1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon)
+            policy_loss = -jnp.mean(
+                jnp.minimum(ratios * data["advantages"], clipped * data["advantages"])
+            )
 
-        entropy = -jnp.mean(jnp.sum(jnp.exp(log_probs_all) * log_probs_all, axis=-1))
-        approx_kl = jnp.mean(batch["old_log_probs"] - new_log_probs)
-        clip_fraction = jnp.mean((jnp.abs(ratios - 1.0) > config.clip_epsilon).astype(jnp.float32))
+            values = outputs["value"]
+            value_loss = 0.5 * jnp.mean((values - data["returns"]) ** 2)
 
-        total_loss = policy_loss + config.value_coef * value_loss - config.entropy_coef * entropy
-        metrics = {
-            "loss": total_loss,
-            "policy_loss": policy_loss,
-            "value_loss": value_loss,
-            "entropy": entropy,
-            "approx_kl": approx_kl,
-            "clip_fraction": clip_fraction,
-        }
-        return total_loss, metrics
+            entropy = -jnp.mean(jnp.sum(jnp.exp(log_probs_all) * log_probs_all, axis=-1))
+            approx_kl = jnp.mean(data["old_log_probs"] - new_log_probs)
+            clip_fraction = jnp.mean((jnp.abs(ratios - 1.0) > config.clip_epsilon).astype(jnp.float32))
+
+            total_loss = policy_loss + config.value_coef * value_loss - config.entropy_coef * entropy
+            metrics = {
+                "loss": total_loss,
+                "policy_loss": policy_loss,
+                "value_loss": value_loss,
+                "entropy": entropy,
+                "approx_kl": approx_kl,
+                "clip_fraction": clip_fraction,
+            }
+            metrics_acc = {k: metrics_acc[k] + metrics[k] for k in metric_keys}
+            return metrics_acc, None
+
+        metrics_sum, _ = jax.lax.scan(timestep_loss, init_metrics, batch)
+        num_steps = jnp.array(batch["advantages"].shape[0], dtype=jnp.float32)
+        metrics_avg = {k: v / num_steps for k, v in metrics_sum.items()}
+        return metrics_avg["loss"], metrics_avg
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
 
     @jax.jit
     def update(train_state: TrainState, batch: Dict[str, jnp.ndarray], rng: jax.Array, cache: TaskCache):
+        rollout_length = batch["advantages"].shape[0]
+
         def epoch_step(carry, _):
             state, key = carry
             key, perm_key = jax.random.split(key)
-            permutation = jax.random.permutation(perm_key, batch_size)
-            shuffled = {k: jnp.take(v, permutation, axis=0) for k, v in batch.items()}
-            reshaped = {k: v.reshape((config.num_minibatches, minibatch_size) + v.shape[1:]) for k, v in shuffled.items()}
+            permutation = jax.random.permutation(perm_key, rollout_length)
+            permuted = permutation.reshape((config.num_minibatches, steps_per_minibatch))
 
-            def minibatch_step(state, minibatch):
+            def minibatch_step(state, timestep_idx):
+                minibatch = {k: jnp.take(v, timestep_idx, axis=0) for k, v in batch.items()}
                 (loss_val, metrics), grads = grad_fn(state.params, minibatch, cache)
                 state = state.apply_gradients(grads=grads)
                 return state, metrics
 
-            state, mb_metrics = jax.lax.scan(minibatch_step, state, reshaped)
+            state, mb_metrics = jax.lax.scan(minibatch_step, state, permuted)
             metrics_avg = tree_util.tree_map(lambda x: jnp.mean(x, axis=0), mb_metrics)
             return (state, key), metrics_avg
 
-        (new_state, new_key), epoch_metrics = jax.lax.scan(epoch_step, (train_state, rng), jnp.arange(config.num_epochs))
+        (new_state, new_key), epoch_metrics = jax.lax.scan(
+            epoch_step, (train_state, rng), jnp.arange(config.num_epochs)
+        )
         metrics = tree_util.tree_map(lambda x: jnp.mean(x, axis=0), epoch_metrics)
         return new_state, new_key, metrics
 
@@ -661,7 +680,7 @@ def main():
     num_actions = env.NUM_ACTIONS
     max_steps = env.max_steps
 
-    model = PerceiverActorCritic()
+    model = PerceiverActorCritic(dtype=jnp.bfloat16, use_remat=True)
 
     rng = jax.random.PRNGKey(config.seed)
     rng, reset_key = jax.random.split(rng)
@@ -733,20 +752,20 @@ def main():
             config.gae_lambda,
         )
 
-        adv_flat = advantages.reshape(-1)
-        adv_flat = (adv_flat - jnp.mean(adv_flat)) / (jnp.std(adv_flat) + 1e-8)
+        adv_mean = jnp.mean(advantages)
+        adv_std = jnp.std(advantages)
+        advantages = (advantages - adv_mean) / (adv_std + 1e-8)
 
         batch = {
-            "canvas": flatten_batch(traj.canvas),
-            "cursor": flatten_batch(traj.cursor),
-            "last_action": flatten_batch(traj.last_action),
-            "selected_color": flatten_batch(traj.selected_color),
-            "steps": flatten_batch(traj.steps),
-            "actions": flatten_batch(traj.actions).astype(jnp.int32),
-            "old_log_probs": flatten_batch(traj.log_probs),
-            "advantages": adv_flat,
-            "returns": returns.reshape(-1),
-            "env_ids": flatten_batch(traj.env_id).astype(jnp.int32),
+            "canvas": traj.canvas,
+            "cursor": traj.cursor,
+            "last_action": traj.last_action,
+            "selected_color": traj.selected_color,
+            "steps": traj.steps,
+            "actions": traj.actions.astype(jnp.int32),
+            "old_log_probs": traj.log_probs,
+            "advantages": advantages,
+            "returns": returns,
         }
 
         rng, update_key = jax.random.split(rng)
