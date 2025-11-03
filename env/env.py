@@ -445,7 +445,9 @@ class ARCEnv:
             hit_budget = new_steps >= jnp.array(self.max_steps, dtype=jnp.int32)
 
             score_new = self._compute_score(new_canvas, s.target, s.valid_mask)
-            reward = score_new - s.prev_progress
+            reward_dense = score_new - s.prev_progress
+            reward_sparse = jnp.where(send_mask, score_new, jnp.array(0.0, dtype=jnp.float32))
+            reward = reward_dense if self.dense_reward else reward_sparse
 
             next_done = jnp.logical_or(send_mask, hit_budget)
 

@@ -34,7 +34,7 @@ def test_basic_reset_and_step():
     sample_json = (
         '{"train": [{"input": [[1,2],[3,4]], "output": [[5,6],[7,8]]}], "test": []}'
     )
-    env = ARCEnv.from_json(sample_json, max_steps=10)
+    env = ARCEnv.from_json(sample_json, max_steps=10, reward_mode="dense")
 
     rng = jax.random.PRNGKey(42)
     state = env.env_reset(rng, train=True)
@@ -65,7 +65,7 @@ def test_masked_reward():
     print("Testing masked reward...")
 
     sample_json = '{"train": [{"input": [[1]], "output": [[2]]}], "test": []}'
-    env = ARCEnv.from_json(sample_json, max_steps=10)
+    env = ARCEnv.from_json(sample_json, max_steps=10, reward_mode="dense")
 
     base_key = jax.random.PRNGKey(0)
     key_send_only, key_success, key_padded = jax.random.split(base_key, 3)
@@ -103,7 +103,7 @@ def test_send_action():
     print("Testing send action...")
 
     sample_json = '{"train": [{"input": [[1]], "output": [[1]]}], "test": []}'
-    env = ARCEnv.from_json(sample_json, max_steps=10)
+    env = ARCEnv.from_json(sample_json, max_steps=10, reward_mode="dense")
 
     key_fail, key_success = jax.random.split(jax.random.PRNGKey(5))
 
@@ -303,7 +303,7 @@ def test_termination_conditions():
     state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_COPY))
     state, reward, done = env.env_step(state, jnp.array(ARCEnv.ACT_SEND))
     assert _as_bool(done) is True, "Should be done after SEND"
-    assert _as_float(reward) == 2.5, "Should get reward 2.5 for solved SEND"
+    assert abs(_as_float(reward) - 2.2) < 1e-5, "Should get final score as reward for solved SEND"
 
     env2 = ARCEnv.from_json(sample_json, max_steps=2)
     state2 = env2.env_reset(key_budget, train=True)
