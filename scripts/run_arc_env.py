@@ -119,6 +119,7 @@ def main():
             Path(args.data_dir),
             max_steps=args.max_steps,
             reward_mode=args.reward_mode,
+            max_demo_pairs=5,
         )
         print(f"Loaded environment from {args.data_dir}")
         print(f"  Train examples: {env.train_input.shape[0]}")

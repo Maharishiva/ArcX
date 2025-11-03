@@ -36,8 +36,6 @@ from nets.PerceiverActorCritic import PerceiverActorCritic
 
 
 class RolloutBatch(NamedTuple):
-    inputs: jnp.ndarray
-    targets: jnp.ndarray
     canvas: jnp.ndarray
     cursor: jnp.ndarray
     last_action: jnp.ndarray
@@ -48,11 +46,15 @@ class RolloutBatch(NamedTuple):
     values: jnp.ndarray
     rewards: jnp.ndarray
     dones: jnp.ndarray
+    env_id: jnp.ndarray
 
 
 class TaskCache(NamedTuple):
+    grids: jnp.ndarray
+    grid_ids: jnp.ndarray
     tokens: jnp.ndarray
     pos: jnp.ndarray
+    mask: jnp.ndarray
 
 
 @dataclass(frozen=True)
@@ -63,11 +65,11 @@ class PPOConfig:
     rollout_length: int = 32
     total_updates: int = 200
     learning_rate: float = 3e-4
-    gamma: float = 0.99
+    gamma: float = 0.996
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.2
     value_coef: float = 0.5
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.05
     num_minibatches: int = 4
     num_epochs: int = 4
     max_grad_norm: float = 0.5
@@ -78,6 +80,7 @@ class PPOConfig:
     checkpoint_interval: int | None = None
     checkpoint_dir: str | None = "checkpoints/ppo"
     reward_mode: str = "sparse"
+    max_demo_pairs: int = 5
     wandb_project: Optional[str] = None
     wandb_entity: Optional[str] = None
     wandb_run_name: Optional[str] = None
@@ -169,20 +172,17 @@ def flatten_batch(x: jnp.ndarray) -> jnp.ndarray:
     return x.reshape(new_shape)
 
 
-def make_task_cache_fn(model_apply):
-    grid_type_ids = jnp.array([0, 1], dtype=jnp.int32)
-
+def make_task_cache_fn(model_apply, env):
     @jax.jit
-    def cache_fn(params: Dict[str, jnp.ndarray], inputs: jnp.ndarray, targets: jnp.ndarray):
-        task_grids = jnp.stack([inputs, targets], axis=1)
-        ids = jnp.broadcast_to(grid_type_ids[None, :], (task_grids.shape[0], grid_type_ids.shape[0]))
+    def cache_fn(params: Dict[str, jnp.ndarray], problem_indices: jnp.ndarray):
+        task_grids, grid_ids, token_mask = env.build_context_batch(problem_indices)
         tokens, pos = model_apply(
             {"params": params},
             task_grids,
-            ids,
+            grid_ids,
             method=PerceiverActorCritic.prepare_task_cache,
         )
-        return task_grids, ids, TaskCache(tokens, pos)
+        return TaskCache(task_grids, grid_ids, tokens, pos, token_mask)
 
     return cache_fn
 
@@ -198,8 +198,6 @@ def make_rollout_fn(
     def policy_forward(
         params: Dict[str, jnp.ndarray],
         state: ARCEnvState,
-        task_grids: jnp.ndarray,
-        grid_ids: jnp.ndarray,
         cache: TaskCache,
     ):
         extra_feats = build_extra_canvas_features(
@@ -213,12 +211,13 @@ def make_rollout_fn(
         )
         outputs = model_apply(
             {"params": params},
-            task_grids,
-            grid_ids,
+            cache.grids,
+            cache.grid_ids,
             state.canvas,
             extra_feats,
             cached_task_tokens=cache.tokens,
             cached_task_pos=cache.pos,
+            cached_task_mask=cache.mask,
             deterministic=True,
         )
         cursor_logits = select_cursor_logits(outputs["logits"], state.cursor, grid_size)
@@ -229,11 +228,9 @@ def make_rollout_fn(
         params: Dict[str, jnp.ndarray],
         rng_key: jax.Array,
         state: ARCEnvState,
-        task_grids: jnp.ndarray,
-        grid_ids: jnp.ndarray,
         cache: TaskCache,
     ):
-        log_probs_all, values = policy_forward(params, state, task_grids, grid_ids, cache)
+        log_probs_all, values = policy_forward(params, state, cache)
         actions = jax.random.categorical(rng_key, log_probs_all, axis=-1).astype(jnp.int32)
         idx = jnp.arange(actions.shape[0])
         log_probs = log_probs_all[idx, actions]
@@ -243,11 +240,9 @@ def make_rollout_fn(
     def policy_step_greedy(
         params: Dict[str, jnp.ndarray],
         state: ARCEnvState,
-        task_grids: jnp.ndarray,
-        grid_ids: jnp.ndarray,
         cache: TaskCache,
     ):
-        log_probs_all, values = policy_forward(params, state, task_grids, grid_ids, cache)
+        log_probs_all, values = policy_forward(params, state, cache)
         actions = jnp.argmax(log_probs_all, axis=-1).astype(jnp.int32)
         idx = jnp.arange(actions.shape[0])
         log_probs = log_probs_all[idx, actions]
@@ -258,18 +253,16 @@ def make_rollout_fn(
         params: Dict[str, jnp.ndarray],
         state: ARCEnvState,
         rng: jax.Array,
-        task_grids: jnp.ndarray,
-        grid_ids: jnp.ndarray,
         cache: TaskCache,
     ):
+        env_ids = jnp.arange(state.canvas.shape[0], dtype=jnp.int32)
+
         def step(carry, _):
             key, env_state = carry
             key, step_key = jax.random.split(key)
-            actions, log_probs, values = policy_step(params, step_key, env_state, task_grids, grid_ids, cache)
+            actions, log_probs, values = policy_step(params, step_key, env_state, cache)
             next_state, rewards, dones = env.env_step_batch(env_state, actions)
             transition = (
-                env_state.inp,
-                env_state.target,
                 env_state.canvas,
                 env_state.cursor,
                 env_state.last_action,
@@ -280,6 +273,7 @@ def make_rollout_fn(
                 values,
                 rewards,
                 dones,
+                env_ids,
             )
             return (key, next_state), transition
 
@@ -304,8 +298,6 @@ def make_value_fn(
     def value_fn(
         params: Dict[str, jnp.ndarray],
         state: ARCEnvState,
-        task_grids: jnp.ndarray,
-        grid_ids: jnp.ndarray,
         cache: TaskCache,
     ) -> jnp.ndarray:
         extra_feats = build_extra_canvas_features(
@@ -319,12 +311,13 @@ def make_value_fn(
         )
         outputs = model_apply(
             {"params": params},
-            task_grids,
-            grid_ids,
+            cache.grids,
+            cache.grid_ids,
             state.canvas,
             extra_feats,
             cached_task_tokens=cache.tokens,
             cached_task_pos=cache.pos,
+            cached_task_mask=cache.mask,
             deterministic=True,
         )
         return outputs["value"]
@@ -339,13 +332,16 @@ def make_ppo_update_fn(
     num_actions: int,
     max_steps: int,
 ):
-    grid_type_ids = jnp.array([0, 1], dtype=jnp.int32)
     batch_size = config.num_envs * config.rollout_length
     minibatch_size = batch_size // config.num_minibatches
 
-    def loss_fn(params, batch):
-        task_grids = jnp.stack([batch["inputs"], batch["targets"]], axis=1)
-        grid_ids = jnp.broadcast_to(grid_type_ids[None, :], (task_grids.shape[0], grid_type_ids.shape[0]))
+    def loss_fn(params, batch, cache: TaskCache):
+        env_ids = batch["env_ids"].astype(jnp.int32)
+        task_grids = cache.grids[env_ids]
+        grid_ids = cache.grid_ids[env_ids]
+        cached_tokens = cache.tokens[env_ids]
+        cached_pos = cache.pos[env_ids]
+        cached_mask = cache.mask[env_ids]
         extra_feats = build_extra_canvas_features(
             batch["cursor"],
             batch["last_action"],
@@ -355,7 +351,17 @@ def make_ppo_update_fn(
             num_actions,
             max_steps,
         )
-        outputs = model_apply({"params": params}, task_grids, grid_ids, batch["canvas"], extra_feats, deterministic=False)
+        outputs = model_apply(
+            {"params": params},
+            task_grids,
+            grid_ids,
+            batch["canvas"],
+            extra_feats,
+            cached_task_tokens=cached_tokens,
+            cached_task_pos=cached_pos,
+            cached_task_mask=cached_mask,
+            deterministic=False,
+        )
         cursor_logits = select_cursor_logits(outputs["logits"], batch["cursor"], grid_size)
         log_probs_all = jax.nn.log_softmax(cursor_logits, axis=-1)
         idx = jnp.arange(cursor_logits.shape[0])
@@ -386,7 +392,7 @@ def make_ppo_update_fn(
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
 
     @jax.jit
-    def update(train_state: TrainState, batch: Dict[str, jnp.ndarray], rng: jax.Array):
+    def update(train_state: TrainState, batch: Dict[str, jnp.ndarray], rng: jax.Array, cache: TaskCache):
         def epoch_step(carry, _):
             state, key = carry
             key, perm_key = jax.random.split(key)
@@ -395,7 +401,7 @@ def make_ppo_update_fn(
             reshaped = {k: v.reshape((config.num_minibatches, minibatch_size) + v.shape[1:]) for k, v in shuffled.items()}
 
             def minibatch_step(state, minibatch):
-                (loss_val, metrics), grads = grad_fn(state.params, minibatch)
+                (loss_val, metrics), grads = grad_fn(state.params, minibatch, cache)
                 state = state.apply_gradients(grads=grads)
                 return state, metrics
 
@@ -430,8 +436,11 @@ def reset_done_envs(env, state: ARCEnvState, rng: jax.Array, batch_size: int) ->
         done=_select(reset_state.done, state.done),
         steps=_select(reset_state.steps, state.steps),
         episode_idx=_select(reset_state.episode_idx, state.episode_idx),
+        problem_idx=_select(reset_state.problem_idx, state.problem_idx),
         selected_color=_select(reset_state.selected_color, state.selected_color),
         last_action=_select(reset_state.last_action, state.last_action),
+        baseline_score=_select(reset_state.baseline_score, state.baseline_score),
+        prev_progress=_select(reset_state.prev_progress, state.prev_progress),
     )
 
 
@@ -480,11 +489,11 @@ def evaluate_policy(
     def run_split(rng_key: jax.Array, train_flag: bool):
         rng_key, reset_key = jax.random.split(rng_key)
         state = env.env_reset_batch(reset_key, train=train_flag, batch_size=config.eval_envs)
-        task_grids, grid_ids, cache = task_cache_fn(params, state.inp, state.target)
+        cache = task_cache_fn(params, state.problem_idx)
         returns = jnp.zeros((config.eval_envs,), dtype=jnp.float32)
 
         for _ in range(config.eval_horizon):
-            actions, _, _ = policy_step_greedy(params, state, task_grids, grid_ids, cache)
+            actions, _, _ = policy_step_greedy(params, state, cache)
             state, rewards, dones = env.env_step_batch(state, actions)
             returns = returns + rewards
             if bool(jnp.all(dones)):
@@ -554,6 +563,7 @@ def parse_args() -> tuple[PPOConfig, str]:
     parser.add_argument("--eval-horizon", type=int, default=None)
     parser.add_argument("--eval-interval", type=int, default=None)
     parser.add_argument("--log-interval", type=int, default=None)
+    parser.add_argument("--max-demo-pairs", type=int, default=None)
     parser.add_argument("--checkpoint-interval", type=int, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--wandb-project", type=str, default=None)
@@ -642,7 +652,11 @@ def main():
     except RuntimeError:
         load_ctx = nullcontext()
     with load_ctx:
-        env = build_env_from_dir(Path(config.data_dir), reward_mode=config.reward_mode)
+        env = build_env_from_dir(
+            Path(config.data_dir),
+            reward_mode=config.reward_mode,
+            max_demo_pairs=config.max_demo_pairs,
+        )
     grid_size = env.GRID_SIZE
     num_actions = env.NUM_ACTIONS
     max_steps = env.max_steps
@@ -653,8 +667,7 @@ def main():
     rng, reset_key = jax.random.split(rng)
     state = env.env_reset_batch(reset_key, train=True, batch_size=config.num_envs)
 
-    task_grids = jnp.stack([state.inp, state.target], axis=1)
-    grid_ids = jnp.broadcast_to(jnp.array([0, 1], dtype=jnp.int32)[None, :], (config.num_envs, 2))
+    task_grids, grid_ids, init_mask = env.build_context_batch(state.problem_idx)
 
     init_extra_feats = build_extra_canvas_features(
         state.cursor,
@@ -667,7 +680,14 @@ def main():
     )
 
     rng, init_key = jax.random.split(rng)
-    params = model.init(init_key, task_grids, grid_ids, state.canvas, init_extra_feats)
+    params = model.init(
+        init_key,
+        task_grids,
+        grid_ids,
+        state.canvas,
+        init_extra_feats,
+        task_mask=init_mask,
+    )
 
     if config.max_grad_norm is not None:
         tx = optax.chain(optax.clip_by_global_norm(config.max_grad_norm), optax.adam(config.learning_rate))
@@ -678,7 +698,7 @@ def main():
     rollout_fn, policy_step_greedy = make_rollout_fn(model.apply, env, config, grid_size, num_actions, max_steps)
     value_fn = make_value_fn(model.apply, grid_size, num_actions, max_steps)
     ppo_update_fn = make_ppo_update_fn(model.apply, config, grid_size, num_actions, max_steps)
-    task_cache_fn = make_task_cache_fn(model.apply)
+    task_cache_fn = make_task_cache_fn(model.apply, env)
 
     param_count = sum(int(x.size) for x in tree_util.tree_leaves(train_state.params))
     print(
@@ -690,24 +710,18 @@ def main():
 
     for update_idx in range(config.total_updates):
         rng, rollout_key = jax.random.split(rng)
-        task_grids, grid_ids, task_cache = task_cache_fn(train_state.params, state.inp, state.target)
+        task_cache = task_cache_fn(train_state.params, state.problem_idx)
         next_state, traj, rollout_key = rollout_fn(
             train_state.params,
             state,
             rollout_key,
-            task_grids,
-            grid_ids,
             task_cache,
         )
 
-        next_task_grids, next_grid_ids, next_task_cache = task_cache_fn(
-            train_state.params, next_state.inp, next_state.target
-        )
+        next_task_cache = task_cache_fn(train_state.params, next_state.problem_idx)
         last_value = value_fn(
             train_state.params,
             next_state,
-            next_task_grids,
-            next_grid_ids,
             next_task_cache,
         )
         advantages, returns = compute_gae(
@@ -723,8 +737,6 @@ def main():
         adv_flat = (adv_flat - jnp.mean(adv_flat)) / (jnp.std(adv_flat) + 1e-8)
 
         batch = {
-            "inputs": flatten_batch(traj.inputs),
-            "targets": flatten_batch(traj.targets),
             "canvas": flatten_batch(traj.canvas),
             "cursor": flatten_batch(traj.cursor),
             "last_action": flatten_batch(traj.last_action),
@@ -734,10 +746,11 @@ def main():
             "old_log_probs": flatten_batch(traj.log_probs),
             "advantages": adv_flat,
             "returns": returns.reshape(-1),
+            "env_ids": flatten_batch(traj.env_id).astype(jnp.int32),
         }
 
         rng, update_key = jax.random.split(rng)
-        train_state, update_key, metrics = ppo_update_fn(train_state, batch, update_key)
+        train_state, update_key, metrics = ppo_update_fn(train_state, batch, update_key, task_cache)
 
         rng, reset_key = jax.random.split(rng)
         state = reset_done_envs(env, next_state, reset_key, config.num_envs)

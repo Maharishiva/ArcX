@@ -1,8 +1,10 @@
 import functools
 import json
+from typing import Optional, Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from .types import ARCEnvState
 from .utils import compute_valid_mask, pad_to_30, flood_fill_n4, shift_grid_to_origin
@@ -60,6 +62,12 @@ class ARCEnv:
         test_output: jnp.ndarray,
         max_steps: int = DEFAULT_MAX_STEPS,
         reward_mode: str = "sparse",
+        *,
+        train_group_ptrs: Optional[jnp.ndarray] = None,
+        train_group_sizes: Optional[jnp.ndarray] = None,
+        train_pair_problem_ids: Optional[jnp.ndarray] = None,
+        test_pair_problem_ids: Optional[jnp.ndarray] = None,
+        max_demo_pairs: int = 5,
     ):
         self.train_input = train_input
         self.train_output = train_output
@@ -67,6 +75,66 @@ class ARCEnv:
         self.test_output = test_output
         self.max_steps = int(max_steps)
         self.dense_reward = reward_mode == "dense"
+        self.max_demo_pairs = max(1, int(max_demo_pairs))
+
+        train_pair_count = int(train_input.shape[0])
+        test_pair_count = int(test_input.shape[0])
+
+        if train_pair_problem_ids is None:
+            if train_pair_count == 0:
+                train_pair_problem_ids = jnp.zeros((0,), dtype=jnp.int32)
+            else:
+                train_pair_problem_ids = jnp.arange(train_pair_count, dtype=jnp.int32)
+        else:
+            train_pair_problem_ids = train_pair_problem_ids.astype(jnp.int32)
+
+        if test_pair_problem_ids is None:
+            if test_pair_count == 0:
+                test_pair_problem_ids = jnp.zeros((0,), dtype=jnp.int32)
+            elif train_pair_count > 0:
+                test_pair_problem_ids = jnp.zeros((test_pair_count,), dtype=jnp.int32)
+            else:
+                test_pair_problem_ids = jnp.arange(test_pair_count, dtype=jnp.int32)
+        else:
+            test_pair_problem_ids = test_pair_problem_ids.astype(jnp.int32)
+
+        self.train_pair_problem_ids = train_pair_problem_ids
+        self.test_pair_problem_ids = test_pair_problem_ids
+
+        if train_group_ptrs is None or train_group_sizes is None:
+            if train_pair_count == 0:
+                train_group_ptrs = jnp.array([0], dtype=jnp.int32)
+                train_group_sizes = jnp.zeros((0,), dtype=jnp.int32)
+            else:
+                ptrs = np.arange(train_pair_count + 1, dtype=np.int32)
+                train_group_ptrs = jnp.asarray(ptrs)
+                train_group_sizes = jnp.ones((train_pair_count,), dtype=jnp.int32)
+        else:
+            train_group_ptrs = train_group_ptrs.astype(jnp.int32)
+            train_group_sizes = train_group_sizes.astype(jnp.int32)
+
+        self.train_group_ptrs = train_group_ptrs
+        self.train_group_sizes = train_group_sizes
+
+        num_groups = int(train_group_ptrs.shape[0]) - 1
+        demo_indices = np.full((num_groups, self.max_demo_pairs), -1, dtype=np.int32)
+        for gid in range(num_groups):
+            start = int(train_group_ptrs[gid])
+            size = int(train_group_ptrs[gid + 1] - train_group_ptrs[gid])
+            take = min(size, self.max_demo_pairs)
+            if take > 0:
+                demo_indices[gid, :take] = np.arange(start, start + take, dtype=np.int32)
+        self.train_demo_indices = jnp.asarray(demo_indices, dtype=jnp.int32)
+        self.train_demo_valid = self.train_demo_indices >= 0
+
+        dummy_grid = jnp.full((1, self.GRID_SIZE, self.GRID_SIZE), self.EMPTY_CELL, dtype=jnp.int32)
+        self.demo_dummy_index = jnp.array(train_pair_count, dtype=jnp.int32)
+        if train_pair_count == 0:
+            self.train_input_with_dummy = dummy_grid
+            self.train_output_with_dummy = dummy_grid
+        else:
+            self.train_input_with_dummy = jnp.concatenate([train_input, dummy_grid], axis=0)
+            self.train_output_with_dummy = jnp.concatenate([train_output, dummy_grid], axis=0)
 
     @staticmethod
     def from_json(json_str: str, max_steps: int = DEFAULT_MAX_STEPS, reward_mode: str = "sparse") -> "ARCEnv":
@@ -85,7 +153,28 @@ class ARCEnv:
         data = json.loads(json_str)
         tr_in, tr_out = _load_pairs(data.get("train", []))
         te_in, te_out = _load_pairs(data.get("test", []))
-        return ARCEnv(tr_in, tr_out, te_in, te_out, max_steps, reward_mode)
+        train_size = tr_in.shape[0]
+        if train_size > 0:
+            train_group_ptrs = jnp.array([0, train_size], dtype=jnp.int32)
+            train_group_sizes = jnp.array([train_size], dtype=jnp.int32)
+            train_problem_ids = jnp.zeros((train_size,), dtype=jnp.int32)
+        else:
+            train_group_ptrs = jnp.array([0], dtype=jnp.int32)
+            train_group_sizes = jnp.zeros((0,), dtype=jnp.int32)
+            train_problem_ids = jnp.zeros((0,), dtype=jnp.int32)
+        test_problem_ids = jnp.zeros((te_in.shape[0],), dtype=jnp.int32)
+        return ARCEnv(
+            tr_in,
+            tr_out,
+            te_in,
+            te_out,
+            max_steps,
+            reward_mode,
+            train_group_ptrs=train_group_ptrs,
+            train_group_sizes=train_group_sizes,
+            train_pair_problem_ids=train_problem_ids,
+            test_pair_problem_ids=test_problem_ids,
+        )
 
     @functools.partial(jax.jit, static_argnums=(0, 2))
     def env_reset(self, rng: jax.Array, train: bool = True) -> ARCEnvState:
@@ -95,10 +184,12 @@ class ARCEnv:
         if train:
             inputs = self.train_input
             targets = self.train_output
+            problem_ids = self.train_pair_problem_ids
             split_name = "train"
         else:
             inputs = self.test_input
             targets = self.test_output
+            problem_ids = self.test_pair_problem_ids
             split_name = "test"
 
         n = inputs.shape[0]
@@ -107,10 +198,13 @@ class ARCEnv:
         idx = jax.random.randint(idx_rng, shape=(), minval=0, maxval=n, dtype=jnp.int32)
         inp = inputs[idx]
         target = targets[idx]
+        problem_idx = jnp.asarray(problem_ids[idx] if problem_ids.size > 0 else 0, dtype=jnp.int32)
 
         canvas = jnp.full((self.GRID_SIZE, self.GRID_SIZE), self.EMPTY_CELL, dtype=jnp.int32)
         cursor = jnp.array([0, 0], dtype=jnp.int32)
         valid_mask = compute_valid_mask(target, self.EMPTY_CELL)
+        baseline_score = jnp.array(0.0, dtype=jnp.float32)
+        initial_progress = self._compute_score(canvas, target, valid_mask)
 
         return ARCEnvState(
             rng=rng_next,
@@ -122,8 +216,11 @@ class ARCEnv:
             done=jnp.array(False),
             steps=jnp.array(0, dtype=jnp.int32),
             episode_idx=idx,
+            problem_idx=problem_idx,
             selected_color=jnp.array(0, dtype=jnp.int32),
             last_action=jnp.array(-1, dtype=jnp.int32),
+            baseline_score=baseline_score,
+            prev_progress=initial_progress,
         )
 
     @functools.partial(jax.jit, static_argnums=(0, 3))
@@ -133,10 +230,12 @@ class ARCEnv:
         if train:
             inputs = self.train_input
             targets = self.train_output
+            problem_ids = self.train_pair_problem_ids
             split_name = "train"
         else:
             inputs = self.test_input
             targets = self.test_output
+            problem_ids = self.test_pair_problem_ids
             split_name = "test"
 
         n = inputs.shape[0]
@@ -144,9 +243,12 @@ class ARCEnv:
             raise ValueError(f"{split_name.capitalize()} dataset is empty. Cannot reset environment.")
         inp = inputs[idx]
         target = targets[idx]
+        problem_idx = jnp.asarray(problem_ids[idx] if problem_ids.size > 0 else 0, dtype=jnp.int32)
         canvas = jnp.full((self.GRID_SIZE, self.GRID_SIZE), self.EMPTY_CELL, dtype=jnp.int32)
         cursor = jnp.array([0, 0], dtype=jnp.int32)
         valid_mask = compute_valid_mask(target, self.EMPTY_CELL)
+        baseline_score = jnp.array(0.0, dtype=jnp.float32)
+        initial_progress = self._compute_score(canvas, target, valid_mask)
 
         return ARCEnvState(
             rng=rng_next,
@@ -158,8 +260,11 @@ class ARCEnv:
             done=jnp.array(False),
             steps=jnp.array(0, dtype=jnp.int32),
             episode_idx=idx,
+            problem_idx=problem_idx,
             selected_color=jnp.array(0, dtype=jnp.int32),
             last_action=jnp.array(-1, dtype=jnp.int32),
+            baseline_score=baseline_score,
+            prev_progress=initial_progress,
         )
 
     @functools.partial(jax.jit, static_argnums=(0, 2, 3))
@@ -171,10 +276,12 @@ class ARCEnv:
         if train:
             inputs = self.train_input
             targets = self.train_output
+            problem_ids = self.train_pair_problem_ids
             split_name = "train"
         else:
             inputs = self.test_input
             targets = self.test_output
+            problem_ids = self.test_pair_problem_ids
             split_name = "test"
 
         n = inputs.shape[0]
@@ -183,10 +290,13 @@ class ARCEnv:
         idxs = jax.random.randint(keys[0], shape=(batch_size,), minval=0, maxval=n, dtype=jnp.int32)
         inp = jnp.take(inputs, idxs, axis=0)
         target = jnp.take(targets, idxs, axis=0)
+        problem_idx = jnp.take(problem_ids, idxs, axis=0) if problem_ids.size > 0 else jnp.zeros_like(idxs)
 
         canvas = jnp.full((batch_size, self.GRID_SIZE, self.GRID_SIZE), self.EMPTY_CELL, dtype=jnp.int32)
         cursor = jnp.zeros((batch_size, 2), dtype=jnp.int32)
         valid_mask = compute_valid_mask(target, self.EMPTY_CELL)
+        baseline_score = jnp.array(0.0, dtype=jnp.float32)
+        initial_progress = self._compute_score(canvas, target, valid_mask)
 
         return ARCEnvState(
             rng=per_env_rng,
@@ -198,9 +308,68 @@ class ARCEnv:
             done=jnp.zeros((batch_size,), dtype=bool),
             steps=jnp.zeros((batch_size,), dtype=jnp.int32),
             episode_idx=idxs,
+            problem_idx=problem_idx,
             selected_color=jnp.zeros((batch_size,), dtype=jnp.int32),
             last_action=jnp.full((batch_size,), -1, dtype=jnp.int32),
+            baseline_score=baseline_score,
+            prev_progress=initial_progress,
         )
+
+    def _compute_score(self, canvas: jnp.ndarray, target: jnp.ndarray, valid_mask: jnp.ndarray) -> jnp.ndarray:
+        canvas_mask = canvas != self.EMPTY_CELL
+        valid_mask_bool = valid_mask.astype(bool)
+        intersection = jnp.sum((canvas_mask & valid_mask_bool).astype(jnp.float32), axis=(-2, -1))
+        union = jnp.sum((canvas_mask | valid_mask_bool).astype(jnp.float32), axis=(-2, -1))
+        iou = jnp.where(union > 0.0, intersection / union, jnp.ones_like(union))
+
+        valid_cells = jnp.sum(valid_mask_bool.astype(jnp.float32), axis=(-2, -1))
+        correct = jnp.sum(((canvas == target) & valid_mask_bool).astype(jnp.float32), axis=(-2, -1))
+        valid_accuracy = jnp.where(
+            valid_cells > 0.0,
+            correct / jnp.maximum(valid_cells, 1.0),
+            jnp.ones_like(valid_cells),
+        )
+
+        full_match = jnp.all(canvas == target, axis=(-2, -1)).astype(jnp.float32)
+        score = 0.2 * iou + valid_accuracy + full_match
+        return score.astype(jnp.float32)
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def build_context_batch(self, problem_indices: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        problem_indices = jnp.asarray(problem_indices, dtype=jnp.int32)
+        batch_size = problem_indices.shape[0]
+        num_grids = self.max_demo_pairs * 2
+        token_dim = self.GRID_SIZE * self.GRID_SIZE
+
+        num_groups = int(self.train_demo_indices.shape[0])
+        grid_id_inputs = jnp.arange(self.max_demo_pairs, dtype=jnp.int32)
+        grid_id_outputs = grid_id_inputs + self.max_demo_pairs
+        grid_id_template = jnp.stack([grid_id_inputs, grid_id_outputs], axis=1).reshape(-1)
+
+        if num_groups == 0:
+            empty_grid = jnp.full((self.GRID_SIZE, self.GRID_SIZE), self.EMPTY_CELL, dtype=jnp.int32)
+            task_grids = jnp.broadcast_to(empty_grid, (batch_size, num_grids, self.GRID_SIZE, self.GRID_SIZE))
+            grid_ids = jnp.broadcast_to(grid_id_template[None, :], (batch_size, num_grids))
+            mask = jnp.zeros((batch_size, 1, 1, num_grids * token_dim), dtype=bool)
+            return task_grids, grid_ids, mask
+
+        safe_idx = jnp.clip(problem_indices, 0, num_groups - 1)
+        gathered_idx = self.train_demo_indices[safe_idx]
+        valid_pairs = self.train_demo_valid[safe_idx]
+        gather_idx = jnp.where(valid_pairs, gathered_idx, self.demo_dummy_index)
+
+        demo_inputs = jnp.take(self.train_input_with_dummy, gather_idx, axis=0)
+        demo_outputs = jnp.take(self.train_output_with_dummy, gather_idx, axis=0)
+
+        stacked = jnp.stack([demo_inputs, demo_outputs], axis=2)
+        task_grids = stacked.reshape(batch_size, num_grids, self.GRID_SIZE, self.GRID_SIZE)
+
+        grid_ids = jnp.broadcast_to(grid_id_template[None, :], (batch_size, num_grids))
+        pair_mask = jnp.repeat(valid_pairs, 2, axis=1)
+        token_mask = jnp.repeat(pair_mask[..., None], token_dim, axis=2)
+        token_mask = token_mask.reshape(batch_size, 1, 1, num_grids * token_dim)
+
+        return task_grids, grid_ids, token_mask.astype(bool)
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def env_step(self, state: ARCEnvState, action: jnp.ndarray):
@@ -250,9 +419,9 @@ class ARCEnv:
             # Crop region to EMPTY_CELL (-1) from cursor to bottom-right
             rows = jnp.arange(self.GRID_SIZE, dtype=jnp.int32)
             cols = jnp.arange(self.GRID_SIZE, dtype=jnp.int32)
-            crop_mask_rows = rows[:, None] >= cursor_after_move[0]
-            crop_mask_cols = cols[None, :] >= cursor_after_move[1]
-            crop_region = crop_mask_rows & crop_mask_cols
+            crop_mask_rows = rows[:, None] > cursor_after_move[0]
+            crop_mask_cols = cols[None, :] > cursor_after_move[1]
+            crop_region = crop_mask_rows | crop_mask_cols
             cropped_canvas = jnp.where(crop_region, self.EMPTY_CELL, s.canvas)
 
             # Move the subgrid so that the cursor lands at (0,0), fill leftover with BACKGROUND_COLOR
@@ -275,24 +444,10 @@ class ARCEnv:
             new_steps = s.steps + jnp.array(1, dtype=jnp.int32)
             hit_budget = new_steps >= jnp.array(self.max_steps, dtype=jnp.int32)
 
-            # Reward components
-            cells_equal = new_canvas == s.target
-            valid_cells_match = jnp.all(jnp.where(s.valid_mask, cells_equal, True))
-            comp_match = jnp.where(valid_cells_match, jnp.array(0.5, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32))
-
-            canvas_mask = new_canvas != self.EMPTY_CELL
-            iou_intersection = jnp.sum((canvas_mask & s.valid_mask).astype(jnp.int32)).astype(jnp.float32)
-            iou_union = jnp.sum((canvas_mask | s.valid_mask).astype(jnp.int32)).astype(jnp.float32)
-            iou = jnp.where(iou_union > 0.0, iou_intersection / iou_union, jnp.array(1.0, dtype=jnp.float32))
-
-            full_match = jnp.all(cells_equal)
-            comp_full = jnp.where(full_match, jnp.array(1.0, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32))
-
-            total_reward = comp_match + iou + comp_full
-
-            is_terminal_event = jnp.logical_or(send_mask, hit_budget)
-            dense = jnp.array(self.dense_reward)
-            reward = jnp.where(jnp.logical_or(dense, is_terminal_event), total_reward, jnp.array(0.0, dtype=jnp.float32))
+            score_new = self._compute_score(new_canvas, s.target, s.valid_mask)
+            reward_dense = score_new - s.prev_progress
+            reward_sparse = jnp.where(send_mask, score_new, jnp.array(0.0, dtype=jnp.float32))
+            reward = reward_dense if self.dense_reward else reward_sparse
 
             next_done = jnp.logical_or(send_mask, hit_budget)
 
@@ -306,8 +461,11 @@ class ARCEnv:
                 done=next_done,
                 steps=new_steps,
                 episode_idx=s.episode_idx,
+                problem_idx=s.problem_idx,
                 selected_color=selected_color_after,
                 last_action=a,
+                baseline_score=s.baseline_score,
+                prev_progress=score_new,
             )
             return next_state, reward, next_done
 

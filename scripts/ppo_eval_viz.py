@@ -122,8 +122,6 @@ def make_greedy_policy(model, grid_size: int, num_actions: int, max_steps: int):
     def policy_fn(
         params: dict,
         state,
-        task_grids: jnp.ndarray,
-        grid_ids: jnp.ndarray,
         cache: TaskCache,
     ):
         extra_feats = build_extra_canvas_features(
@@ -137,12 +135,13 @@ def make_greedy_policy(model, grid_size: int, num_actions: int, max_steps: int):
         )
         outputs = model.apply(
             {"params": params},
-            task_grids,
-            grid_ids,
+            cache.grids,
+            cache.grid_ids,
             state.canvas,
             extra_feats,
             cached_task_tokens=cache.tokens,
             cached_task_pos=cache.pos,
+            cached_task_mask=cache.mask,
             deterministic=True,
         )
         logits = select_cursor_logits(outputs["logits"], state.cursor, grid_size)
@@ -222,7 +221,7 @@ def main():
     active_device = args.device or _requested_device or "cpu"
     print(f"Using device preset '{active_device}' for evaluation.")
 
-    env = build_env_from_dir(Path(args.data_dir), reward_mode=args.reward_mode)
+    env = build_env_from_dir(Path(args.data_dir), reward_mode=args.reward_mode, max_demo_pairs=5)
     grid_size = env.GRID_SIZE
     num_actions = env.NUM_ACTIONS
     max_steps = env.max_steps
@@ -230,7 +229,7 @@ def main():
     model = PerceiverActorCritic()
     params = load_params(model, Path(args.checkpoint))
 
-    task_cache_fn = make_task_cache_fn(model.apply)
+    task_cache_fn = make_task_cache_fn(model.apply, env)
     greedy_policy = make_greedy_policy(model, grid_size, num_actions, max_steps)
 
     rng = jax.random.PRNGKey(args.seed)
@@ -245,7 +244,7 @@ def main():
     for episode in range(args.num_episodes):
         rng, reset_key = jax.random.split(rng)
         state = env.env_reset_batch(reset_key, train=False, batch_size=1)
-        task_grids, grid_ids, cache = task_cache_fn(params, state.inp, state.target)
+        cache = task_cache_fn(params, state.problem_idx)
 
         frames: List[np.ndarray] = []
         total_reward = 0.0
@@ -255,7 +254,7 @@ def main():
 
         for step in range(args.rollout_horizon):
             frames.append(build_frame(state, inp_np, tgt_np, grid_size))
-            actions, values = greedy_policy(params, state, task_grids, grid_ids, cache)
+            actions, values = greedy_policy(params, state, cache)
             state, reward, done = env.env_step_batch(state, actions)
             total_reward += float(reward[0])
             if bool(done[0]):

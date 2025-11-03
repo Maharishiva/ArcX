@@ -1,11 +1,19 @@
 """Comprehensive test suite for the ARC environment."""
 
 import os
+import sys
+from pathlib import Path
 
 os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 
 import jax
 import jax.numpy as jnp
+
+from dataclasses import replace
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from env import ARCEnv
 from env.wrappers import make_batched_reset, make_batched_step, observe, observe_compact
@@ -26,7 +34,7 @@ def test_basic_reset_and_step():
     sample_json = (
         '{"train": [{"input": [[1,2],[3,4]], "output": [[5,6],[7,8]]}], "test": []}'
     )
-    env = ARCEnv.from_json(sample_json, max_steps=10)
+    env = ARCEnv.from_json(sample_json, max_steps=10, reward_mode="dense")
 
     rng = jax.random.PRNGKey(42)
     state = env.env_reset(rng, train=True)
@@ -57,7 +65,7 @@ def test_masked_reward():
     print("Testing masked reward...")
 
     sample_json = '{"train": [{"input": [[1]], "output": [[2]]}], "test": []}'
-    env = ARCEnv.from_json(sample_json, max_steps=10)
+    env = ARCEnv.from_json(sample_json, max_steps=10, reward_mode="dense")
 
     base_key = jax.random.PRNGKey(0)
     key_send_only, key_success, key_padded = jax.random.split(base_key, 3)
@@ -71,10 +79,10 @@ def test_masked_reward():
     # Painting the correct value in the valid region and then sending yields reward.
     state = env.env_reset(key_success, train=True)
     state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_CHOOSE_COLOR_START + 2))
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT))
+    state, paint_reward, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT))
+    assert abs(_as_float(paint_reward) - 2.2) < 1e-5, "Painting correct cell should yield shaped reward"
     state, reward, done = env.env_step(state, jnp.array(ARCEnv.ACT_SEND))
-    # New reward: 0.5 (board match) + 1.0 (IoU) + 1.0 (full match) = 2.5 max
-    assert _as_float(reward) == 2.5, "Correct solution should yield reward 2.5"
+    assert _as_float(reward) == 0.0, "SEND after solving should not add extra reward"
     assert _as_bool(done) is True, "SEND should terminate"
 
     # Painting in a padded region should not affect reward when sending.
@@ -95,7 +103,7 @@ def test_send_action():
     print("Testing send action...")
 
     sample_json = '{"train": [{"input": [[1]], "output": [[1]]}], "test": []}'
-    env = ARCEnv.from_json(sample_json, max_steps=10)
+    env = ARCEnv.from_json(sample_json, max_steps=10, reward_mode="dense")
 
     key_fail, key_success = jax.random.split(jax.random.PRNGKey(5))
 
@@ -105,10 +113,11 @@ def test_send_action():
     assert _as_float(reward) == 0.0, "Incorrect canvas should yield zero reward"
 
     state = env.env_reset(key_success, train=True)
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_COPY))
+    state, reward_copy, _ = env.env_step(state, jnp.array(ARCEnv.ACT_COPY))
+    assert abs(_as_float(reward_copy) - 2.2) < 1e-5, "Copying baseline should yield the full score jump"
     state, reward, done = env.env_step(state, jnp.array(ARCEnv.ACT_SEND))
     assert _as_bool(done) is True, "SEND should terminate when solved"
-    assert _as_float(reward) == 2.5, "Solved canvas should yield reward 2.5"
+    assert _as_float(reward) == 0.0, "Final reward is emitted via progress steps"
 
     print("✓ Send action works correctly")
 
@@ -131,29 +140,35 @@ def test_crop_action():
     """Test crop action (action 16)."""
     print("Testing crop action...")
 
-    sample_json = '{"train": [{"input": [[1,2,3],[4,5,6]], "output": [[1,2,3],[4,5,6]]}], "test": []}'
-    env = ARCEnv.from_json(sample_json, max_steps=20)
+    env = ARCEnv.from_json('{"train": [], "test": [{"input": [[0]], "output": [[0]]}]}', max_steps=20)
 
-    state = env.env_reset(jax.random.PRNGKey(7), train=True)
+    state = env.env_reset(jax.random.PRNGKey(7), train=False)
+    base_canvas = jnp.full((env.GRID_SIZE, env.GRID_SIZE), ARCEnv.EMPTY_CELL, dtype=jnp.int32)
+    pattern = jnp.array(
+        [
+            [0, 1, 2],
+            [1, 2, 3],
+            [2, 3, 4],
+        ],
+        dtype=jnp.int32,
+    )
+    base_canvas = base_canvas.at[:3, :3].set(pattern)
+    cursor = jnp.array([1, 1], dtype=jnp.int32)
 
-    # Paint color 0 at (0,0)
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_CHOOSE_COLOR_START))
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT))
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_RIGHT))
-    # Paint color 1
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_CHOOSE_COLOR_START + 1))
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT))
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_RIGHT))
-    # Paint color 2
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_CHOOSE_COLOR_START + 2))
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_PAINT))
-    state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_LEFT))
+    state = replace(state, canvas=base_canvas, cursor=cursor)
     state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_CROP))
 
-    assert state.canvas[0, 0] == 0, "Cell before crop point should be preserved"
-    assert state.canvas[0, 1] == ARCEnv.EMPTY_CELL, "Cell at crop point should be EMPTY"
-    assert state.canvas[0, 2] == ARCEnv.EMPTY_CELL, "Cells after crop point should be EMPTY"
-    assert state.canvas[1, 0] == ARCEnv.EMPTY_CELL, "Rows below crop should be EMPTY"
+    expected = jnp.array(
+        [
+            [0, 1, ARCEnv.EMPTY_CELL],
+            [1, 2, ARCEnv.EMPTY_CELL],
+            [ARCEnv.EMPTY_CELL, ARCEnv.EMPTY_CELL, ARCEnv.EMPTY_CELL],
+        ],
+        dtype=jnp.int32,
+    )
+
+    assert jnp.array_equal(state.canvas[:3, :3], expected), "Crop should preserve quadrant up-left of cursor"
+    assert jnp.array_equal(state.cursor, cursor), "Cursor position should remain unchanged"
 
     print("✓ Crop action works correctly")
 
@@ -288,7 +303,7 @@ def test_termination_conditions():
     state, _, _ = env.env_step(state, jnp.array(ARCEnv.ACT_COPY))
     state, reward, done = env.env_step(state, jnp.array(ARCEnv.ACT_SEND))
     assert _as_bool(done) is True, "Should be done after SEND"
-    assert _as_float(reward) == 2.5, "Should get reward 2.5 for solved SEND"
+    assert abs(_as_float(reward) - 2.2) < 1e-5, "Should get final score as reward for solved SEND"
 
     env2 = ARCEnv.from_json(sample_json, max_steps=2)
     state2 = env2.env_reset(key_budget, train=True)
