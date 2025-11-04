@@ -702,7 +702,7 @@ def main():
     num_actions = env.NUM_ACTIONS
     max_steps = env.max_steps
 
-    model = PerceiverActorCritic(dtype=jnp.bfloat16, use_remat=True)
+    model = PerceiverActorCritic(dtype=jnp.bfloat16, use_remat=False)
 
     rng = jax.random.PRNGKey(config.seed)
     rng, reset_key = jax.random.split(rng)
