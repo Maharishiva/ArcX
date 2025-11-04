@@ -31,7 +31,6 @@ from scripts.ppo_train import (
     TaskCache,
     build_extra_canvas_features,
     make_task_cache_fn,
-    select_cursor_logits,
 )
 
 PALETTE = np.array(
@@ -117,14 +116,15 @@ def build_frame(state, task_inputs: np.ndarray, task_targets: np.ndarray, grid_s
     return base_row
 
 
-def make_greedy_policy(model, grid_size: int, num_actions: int, max_steps: int):
+def make_sampling_policy(model, grid_size: int, num_actions: int, max_steps: int):
     @jax.jit
     def policy_fn(
         params: dict,
+        rng_key: jax.Array,
         state,
         cache: TaskCache,
     ):
-        extra_feats = build_extra_canvas_features(
+        grid_feats, cursor_feats, cursor_pos = build_extra_canvas_features(
             state.cursor,
             state.last_action,
             state.selected_color,
@@ -138,14 +138,14 @@ def make_greedy_policy(model, grid_size: int, num_actions: int, max_steps: int):
             cache.grids,
             cache.grid_ids,
             state.canvas,
-            extra_feats,
-            cached_task_tokens=cache.tokens,
-            cached_task_pos=cache.pos,
-            cached_task_mask=cache.mask,
+            grid_feats,
+            cursor_token_feats=cursor_feats,
+            cursor_positions=cursor_pos,
+            cached_task_latents=cache.latents,
             deterministic=True,
         )
-        logits = select_cursor_logits(outputs["logits"], state.cursor, grid_size)
-        actions = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+        log_probs = jax.nn.log_softmax(outputs["logits"], axis=-1)
+        actions = jax.random.categorical(rng_key, log_probs, axis=-1).astype(jnp.int32)
         return actions, outputs["value"]
 
     return policy_fn
@@ -229,8 +229,8 @@ def main():
     model = PerceiverActorCritic()
     params = load_params(model, Path(args.checkpoint))
 
-    task_cache_fn = make_task_cache_fn(model.apply, env)
-    greedy_policy = make_greedy_policy(model, grid_size, num_actions, max_steps)
+    task_cache_fn = make_task_cache_fn(model.apply, env, model.task_patch_size)
+    sampling_policy = make_sampling_policy(model, grid_size, num_actions, max_steps)
 
     rng = jax.random.PRNGKey(args.seed)
 
@@ -254,7 +254,8 @@ def main():
 
         for step in range(args.rollout_horizon):
             frames.append(build_frame(state, inp_np, tgt_np, grid_size))
-            actions, values = greedy_policy(params, state, cache)
+            rng, step_key = jax.random.split(rng)
+            actions, _ = sampling_policy(params, step_key, state, cache)
             state, reward, done = env.env_step_batch(state, actions)
             total_reward += float(reward[0])
             if bool(done[0]):

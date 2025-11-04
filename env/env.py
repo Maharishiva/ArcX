@@ -402,8 +402,7 @@ class ARCEnv:
             flood_mask = a == self.ACT_FLOOD_FILL
             crop_mask = a == self.ACT_CROP
             move_origin_mask = a == self.ACT_MOVE_TO_ORIGIN
-            send_allowed = s.steps >= jnp.array(128, dtype=jnp.int32)
-            send_mask = (a == self.ACT_SEND) & send_allowed
+            send_mask = a == self.ACT_SEND
             copy_mask = a == self.ACT_COPY
 
             base_canvas = jnp.where(copy_mask, s.inp, s.canvas)

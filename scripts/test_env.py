@@ -34,7 +34,7 @@ def test_basic_reset_and_step():
     sample_json = (
         '{"train": [{"input": [[1,2],[3,4]], "output": [[5,6],[7,8]]}], "test": []}'
     )
-    env = ARCEnv.from_json(sample_json, max_steps=10, reward_mode="dense")
+    env = ARCEnv.from_json(sample_json, max_steps=10, reward_mode="sparse")
 
     rng = jax.random.PRNGKey(42)
     state = env.env_reset(rng, train=True)
