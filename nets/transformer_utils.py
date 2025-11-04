@@ -13,6 +13,16 @@ from flax import linen as nn
 Array = jax.Array
 
 
+def patch_coordinates(grid_size: int, patch_size: int, dtype: jnp.dtype = jnp.float32) -> Array:
+    """Return (H_ps, W_ps, 2) coordinates centered in each patch."""
+    step = max(patch_size, 1)
+    coords = jnp.arange(0, grid_size, step, dtype=dtype)
+    half = (patch_size - 1) / 2.0
+    centers = coords + half
+    y, x = jnp.meshgrid(centers, centers, indexing="ij")
+    return jnp.stack([y, x], axis=-1)
+
+
 def fourier_encode(x: Array, num_encodings: int = 4) -> Array:
     """Sin/cos Fourier features plus raw coordinates."""
     x = jnp.expand_dims(x, -1)
@@ -126,6 +136,36 @@ def repeat_kv(kv: Array, n_rep: int) -> Array:
     if n_rep == 1:
         return kv
     return rearrange(kv[:, :, :, None, :].repeat(n_rep, axis=3), "b t hkv r d -> b t (hkv r) d")
+
+
+class PatchTokenizer(nn.Module):
+    """Project fixed-size spatial patches into token embeddings."""
+
+    patch_size: int = 3
+    out_dim: int = 128
+    dtype: jnp.dtype = jnp.bfloat16
+
+    @nn.compact
+    def __call__(self, x: Array) -> Array:
+        """Args:
+        x: (B, G, H, W, C) tensor of per-cell embeddings.
+        Returns: (B, G, H/ps, W/ps, out_dim) patch tokens.
+        """
+        ps = self.patch_size
+        if x.ndim != 5:
+            raise ValueError(f"PatchTokenizer expects 5D input, got shape {x.shape}")
+        if x.shape[-3] % ps != 0 or x.shape[-2] % ps != 0:
+            raise ValueError(f"Spatial dims {x.shape[-3:-1]} must be divisible by patch_size={ps}")
+        patches = rearrange(x, "b g (py ps1) (px ps2) c -> b g py px ps1 ps2 c", ps1=ps, ps2=ps)
+        patches = patches.reshape(patches.shape[:4] + (-1,))
+        proj = nn.Dense(
+            self.out_dim,
+            use_bias=False,
+            dtype=self.dtype,
+            kernel_init=nn.initializers.xavier_uniform(),
+            name="patch_proj",
+        )(patches.astype(self.dtype))
+        return proj
 
 
 class SwiGLUFFN(nn.Module):

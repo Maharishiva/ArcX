@@ -15,6 +15,7 @@ import jax.numpy as jnp
 
 from env.env import ARCEnv
 from nets.PerceiverActorCritic import PerceiverActorCritic
+from scripts.ppo_train import build_extra_canvas_features, downsample_token_mask
 
 
 def _build_small_env(max_steps: int = ARCEnv.DEFAULT_MAX_STEPS) -> ARCEnv:
@@ -31,12 +32,27 @@ def _build_small_env(max_steps: int = ARCEnv.DEFAULT_MAX_STEPS) -> ARCEnv:
     return ARCEnv.from_json(sample_json, max_steps=max_steps)
 
 
-def _make_model_inputs(env: ARCEnv, state):
+def _make_model_inputs(env: ARCEnv, state, patch_size: int):
     """Prepare model inputs (batch=1) from env state."""
     problem_idx = jnp.asarray(state.problem_idx)[None]
     task_grids, grid_type_ids, task_mask = env.build_context_batch(problem_idx)
-    canvas_grid = state.canvas[None, ...]  # (1, 30, 30)
-    return task_grids, grid_type_ids, canvas_grid, task_mask
+    patch_mask = downsample_token_mask(task_mask, env.GRID_SIZE, patch_size)
+    canvas_grid = state.canvas[None, ...]
+
+    cursor = state.cursor[None, ...]
+    last_action = state.last_action[None]
+    selected_color = state.selected_color[None]
+    steps = state.steps[None]
+    canvas_feats, cursor_feats, cursor_pos = build_extra_canvas_features(
+        cursor,
+        last_action,
+        selected_color,
+        steps,
+        env.GRID_SIZE,
+        env.NUM_ACTIONS,
+        env.max_steps,
+    )
+    return task_grids, grid_type_ids, canvas_grid, patch_mask, canvas_feats, cursor_feats, cursor_pos
 
 
 class EnvModelIntegrationTest(unittest.TestCase):
@@ -73,23 +89,68 @@ class EnvModelIntegrationTest(unittest.TestCase):
         state = env.env_reset(rng, train=True)
 
         model = PerceiverActorCritic()
-        dummy_task, dummy_ids, dummy_canvas, dummy_mask = _make_model_inputs(env, state)
-        params = model.init(jax.random.PRNGKey(1), dummy_task, dummy_ids, dummy_canvas, task_mask=dummy_mask)
+        (
+            dummy_task,
+            dummy_ids,
+            dummy_canvas,
+            dummy_mask,
+            dummy_feats,
+            dummy_cursor_feats,
+            dummy_cursor_pos,
+        ) = _make_model_inputs(env, state, model.task_patch_size)
+        params = model.init(
+            jax.random.PRNGKey(1),
+            dummy_task,
+            dummy_ids,
+            dummy_canvas,
+            dummy_feats,
+            cursor_token_feats=dummy_cursor_feats,
+            cursor_positions=dummy_cursor_pos,
+            task_mask=dummy_mask,
+        )
 
         @jax.jit
-        def policy_fn(params, rng, task_grids, grid_ids, canvas, task_mask):
-            outputs = model.apply(params, task_grids, grid_ids, canvas, task_mask=task_mask, deterministic=True)
-            pooled_logits = outputs["logits"].mean(axis=1)  # (B, policy_dim)
+        def policy_fn(params, rng, task_grids, grid_ids, canvas, task_mask, feats, cursor_feats, cursor_pos):
+            outputs = model.apply(
+                params,
+                task_grids,
+                grid_ids,
+                canvas,
+                feats,
+                cursor_token_feats=cursor_feats,
+                cursor_positions=cursor_pos,
+                task_mask=task_mask,
+                deterministic=True,
+            )
+            pooled_logits = outputs["logits"]  # already (B, policy_dim)
             actions = jax.random.categorical(rng, pooled_logits, axis=-1)
             return actions.astype(jnp.int32), outputs["value"]
 
         steps_taken = 0
         total_reward = 0.0
         for _ in range(env.max_steps):
-            task_grids, grid_ids, canvas, task_mask = _make_model_inputs(env, state)
+            (
+                task_grids,
+                grid_ids,
+                canvas,
+                task_mask,
+                feats,
+                cursor_feats,
+                cursor_pos,
+            ) = _make_model_inputs(env, state, model.task_patch_size)
             state_rng, action_rng = jax.random.split(state.rng)
             state = replace(state, rng=state_rng)
-            actions, values = policy_fn(params, action_rng, task_grids, grid_ids, canvas, task_mask)
+            actions, values = policy_fn(
+                params,
+                action_rng,
+                task_grids,
+                grid_ids,
+                canvas,
+                task_mask,
+                feats,
+                cursor_feats,
+                cursor_pos,
+            )
             action = int(actions[0])
             state, reward, done = env.env_step(state, jnp.array(action, dtype=jnp.int32))
             steps_taken += 1

@@ -12,10 +12,12 @@ from .transformer_utils import (
     Array,
     AttnConfig,
     DecoderBlock,
+    PatchTokenizer,
     PerceiverBlockConfig,
     PerceiverEncoderBlock,
     RoPEConfig,
     fourier_encode,
+    patch_coordinates,
 )
 
 
@@ -25,6 +27,7 @@ class GridEncoder(nn.Module):
     num_cell_types: int = 16
     num_grid_types: int = 32
     fourier_encodings: int = 4
+    patch_size: int = 3
     dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
@@ -96,8 +99,36 @@ class GridEncoder(nn.Module):
             extra_emb = extra_projector(extra_feats.astype(self.dtype))
             tokens = tokens + extra_emb
 
-        tokens = rearrange(tokens, "b g h w c -> b (g h w) c")
-        pos_xy = rearrange(coords[..., :2], "b g h w c -> b (g h w) c").astype(jnp.float32)
+        patch_size = max(1, self.patch_size)
+        if patch_size == 1:
+            tokens = rearrange(tokens, "b g h w c -> b (g h w) c")
+            pos_xy = rearrange(coords[..., :2], "b g h w c -> b (g h w) c").astype(jnp.float32)
+            return tokens, pos_xy
+
+        patcher = PatchTokenizer(
+            patch_size=patch_size,
+            out_dim=self.latent_dim,
+            dtype=self.dtype,
+            name="patch_tokenizer",
+        )
+        patch_tokens = patcher(tokens)
+
+        patch_coords_hw = patch_coordinates(self.grid_size, patch_size)
+        patch_coords = patch_coords_hw[None, None, ...]
+        patch_coords = jnp.broadcast_to(patch_coords, (B, G) + patch_coords_hw.shape)
+        patch_coords_norm = patch_coords / (self.grid_size - 1.0)
+        patch_pos_feat = fourier_encode(patch_coords_norm, self.fourier_encodings)
+        patch_pos_feat = rearrange(patch_pos_feat, "b g ph pw p c -> b g ph pw (p c)").astype(self.dtype)
+        patch_pos_proj = nn.Dense(
+            self.latent_dim,
+            dtype=self.dtype,
+            kernel_init=nn.initializers.xavier_uniform(),
+            name="patch_pos_proj",
+        )(patch_pos_feat)
+
+        patch_tokens = (patch_tokens + patch_pos_proj).astype(self.dtype)
+        tokens = rearrange(patch_tokens, "b g ph pw c -> b (g ph pw) c")
+        pos_xy = rearrange(patch_coords[..., :2], "b g ph pw c -> b (g ph pw) c").astype(jnp.float32)
         return tokens, pos_xy
 
 
@@ -120,85 +151,49 @@ class PerceiverActorCritic(nn.Module):
     num_cell_types: int = 16
     num_grid_types: int = 32
     canvas_type_id: int = 31
+    grid_size: int = 30
+    task_patch_size: int = 3
+    canvas_patch_size: int = 3
 
     input_rope_cfg: Optional[RoPEConfig] = None
     decoder_rope_cfg: Optional[RoPEConfig] = None
     use_remat: bool = False
+    use_cursor_token: bool = True
+    policy_from_cursor_token: bool = True
 
     def setup(self):
         self.task_grid_encoder = GridEncoder(
             latent_dim=self.latent_dim,
             num_cell_types=self.num_cell_types,
             num_grid_types=self.num_grid_types,
+            patch_size=self.task_patch_size,
             dtype=self.dtype,
         )
         self.canvas_grid_encoder = GridEncoder(
             latent_dim=self.latent_dim,
             num_cell_types=self.num_cell_types,
             num_grid_types=self.num_grid_types,
+            patch_size=self.canvas_patch_size,
             dtype=self.dtype,
         )
 
-    def prepare_task_cache(self, task_grids: Array, task_grid_type_ids: Array) -> Tuple[Array, Array]:
-        """Encode demonstrations once and reuse across multiple forward passes."""
-        return self.task_grid_encoder(task_grids, task_grid_type_ids)
-
     @nn.compact
-    def __call__(
+    def prepare_task_latents(
         self,
-        task_grids: Optional[Array],
-        task_grid_type_ids: Optional[Array],
-        canvas_grid: Array,
-        extra_canvas_feats: Optional[Array] = None,
-        cached_task_tokens: Optional[Array] = None,
-        cached_task_pos: Optional[Array] = None,
-        cached_task_mask: Optional[Array] = None,
+        task_grids: Array,
+        task_grid_type_ids: Array,
         task_mask: Optional[Array] = None,
         deterministic: bool = True,
-    ) -> Dict[str, Array]:
-        """
-        Args:
-            task_grids: (B, G, 30, 30) all context grids
-            task_grid_type_ids: (B, G) or (G,) identifiers (e.g. split/input-output/index)
-            canvas_grid: (B, 30, 30) current canvas
-            extra_canvas_feats: optional (B, 30, 30, F) float features per canvas cell
-            cached_task_tokens: optional precomputed task tokens
-            cached_task_pos: optional precomputed task positional encodings
-            cached_task_mask: optional attention mask for cached tokens (B, 1, 1, T)
-            task_mask: optional attention mask when computing tokens on the fly
-        """
-        B = canvas_grid.shape[0]
+    ) -> Array:
+        """Encode task demonstrations into latent slots for reuse."""
+        task_tokens, task_pos = self.task_grid_encoder(task_grids, task_grid_type_ids)
 
-        if cached_task_tokens is None or cached_task_pos is None:
-            if task_grids is None or task_grid_type_ids is None:
-                raise ValueError("task_grids and task_grid_type_ids must be provided when cache is absent")
-            task_tokens, task_pos = self.prepare_task_cache(task_grids, task_grid_type_ids)
-        else:
-            task_tokens, task_pos = cached_task_tokens, cached_task_pos
-
-        attn_mask = cached_task_mask
-        if attn_mask is None:
-            attn_mask = task_mask
-
-        canvas_ids = jnp.full((B, 1), self.canvas_type_id, dtype=jnp.int32)
-        extra_canvas = None
-        if extra_canvas_feats is not None:
-            extra_canvas = extra_canvas_feats[:, None, ...]
-
-        canvas_tokens, canvas_pos = self.canvas_grid_encoder(
-            canvas_grid[:, None, :, :],
-            canvas_ids,
-            extra_canvas,
-        )
-        canvas_tokens = canvas_tokens.reshape(B, -1, self.latent_dim)
-        canvas_pos = canvas_pos.reshape(B, -1, 2)
-
-        latents = self.param(
+        latents_param = self.param(
             "latents",
             nn.initializers.normal(stddev=0.02),
             (self.num_latents, self.latent_dim),
         )
-        latents = jnp.broadcast_to(latents[None, ...], (B,) + latents.shape).astype(self.dtype)
+        latents = jnp.broadcast_to(latents_param[None, ...], (task_tokens.shape[0],) + latents_param.shape).astype(self.dtype)
 
         attn_cfg = AttnConfig(
             num_heads=self.num_heads,
@@ -217,10 +212,8 @@ class PerceiverActorCritic(nn.Module):
         )
 
         encoder_block_cls = PerceiverEncoderBlock
-        decoder_block_cls = DecoderBlock
         if self.use_remat:
             encoder_block_cls = nn.remat(encoder_block_cls)
-            decoder_block_cls = nn.remat(decoder_block_cls)
 
         for i in range(self.depth):
             latents = encoder_block_cls(
@@ -232,12 +225,79 @@ class PerceiverActorCritic(nn.Module):
                 inputs=task_tokens,
                 input_pos=task_pos,
                 deterministic=deterministic,
-                input_mask=attn_mask,
+                input_mask=task_mask,
             )
 
-        decoder_tokens = jnp.concatenate([latents, canvas_tokens], axis=1)
-        latent_pos = jnp.zeros((B, self.num_latents, 2), dtype=canvas_pos.dtype)
-        decoder_pos = jnp.concatenate([latent_pos, canvas_pos], axis=1)
+        return latents
+
+    @nn.compact
+    def __call__(
+        self,
+        task_grids: Optional[Array],
+        task_grid_type_ids: Optional[Array],
+        canvas_grid: Array,
+        extra_canvas_feats: Optional[Array] = None,
+        cursor_token_feats: Optional[Array] = None,
+        cursor_positions: Optional[Array] = None,
+        cached_task_latents: Optional[Array] = None,
+        task_mask: Optional[Array] = None,
+        deterministic: bool = True,
+    ) -> Dict[str, Array]:
+        """
+        Args:
+            task_grids: (B, G, 30, 30) all context grids
+            task_grid_type_ids: (B, G) or (G,) identifiers (e.g. split/input-output/index)
+            canvas_grid: (B, 30, 30) current canvas
+            extra_canvas_feats: optional (B, 30, 30, F) float features per canvas cell
+            cursor_token_feats: optional (B, Fcursor) features for cursor token construction
+            cursor_positions: optional (B, 2) absolute cursor coordinates
+            cached_task_latents: optional (B, num_latents, latent_dim) precomputed task latents
+            task_mask: optional attention mask when computing tokens on the fly
+        """
+        B = canvas_grid.shape[0]
+
+        if cached_task_latents is None:
+            if task_grids is None or task_grid_type_ids is None:
+                raise ValueError("task_grids and task_grid_type_ids must be provided when cache is absent")
+            latents = self.prepare_task_latents(task_grids, task_grid_type_ids, task_mask=task_mask, deterministic=deterministic)
+        else:
+            latents = cached_task_latents.astype(self.dtype)
+
+        canvas_ids = jnp.full((B, 1), self.canvas_type_id, dtype=jnp.int32)
+        extra_canvas = None
+        if extra_canvas_feats is not None:
+            extra_canvas = extra_canvas_feats[:, None, ...]
+
+        canvas_tokens, canvas_pos = self.canvas_grid_encoder(
+            canvas_grid[:, None, :, :],
+            canvas_ids,
+            extra_canvas,
+        )
+        canvas_tokens = canvas_tokens.reshape(B, -1, self.latent_dim).astype(self.dtype)
+        canvas_pos = canvas_pos.reshape(B, -1, 2)
+
+        decoder_inputs = [latents.astype(self.dtype), canvas_tokens]
+        latent_pos = jnp.zeros((B, latents.shape[1], 2), dtype=canvas_pos.dtype)
+        decoder_positions = [latent_pos, canvas_pos]
+
+        cursor_slice: Optional[Array] = None
+        if self.use_cursor_token:
+            if cursor_token_feats is None or cursor_positions is None:
+                raise ValueError("cursor_token_feats and cursor_positions are required when use_cursor_token is True")
+            cursor_norm = cursor_positions.astype(jnp.float32) / (self.grid_size - 1.0)
+            cursor_features = jnp.concatenate([cursor_token_feats, cursor_norm], axis=-1)
+            cursor_token = nn.Dense(
+                self.latent_dim,
+                dtype=self.dtype,
+                kernel_init=nn.initializers.xavier_uniform(),
+                name="cursor_token_proj",
+            )(cursor_features.astype(self.dtype))
+            cursor_token = cursor_token[:, None, :]
+            decoder_inputs.append(cursor_token)
+            decoder_positions.append(cursor_positions[:, None, :].astype(jnp.float32))
+
+        decoder_tokens = jnp.concatenate(decoder_inputs, axis=1)
+        decoder_pos = jnp.concatenate(decoder_positions, axis=1)
 
         decoder_attn_cfg = AttnConfig(
             num_heads=self.num_heads,
@@ -249,6 +309,10 @@ class PerceiverActorCritic(nn.Module):
         )
         decoder_ff_hidden = self.latent_dim * self.ff_multiplier
 
+        decoder_block_cls = DecoderBlock
+        if self.use_remat:
+            decoder_block_cls = nn.remat(decoder_block_cls)
+
         for i in range(self.decoder_layers):
             decoder_tokens = decoder_block_cls(
                 decoder_attn_cfg,
@@ -258,15 +322,29 @@ class PerceiverActorCritic(nn.Module):
                 name=f"decoder_block_{i}",
             )(decoder_tokens, decoder_pos, deterministic)
 
-        decoded_latents = decoder_tokens[:, : self.num_latents]
-        decoded_canvas = decoder_tokens[:, self.num_latents :]
+        latent_count = latents.shape[1]
+        canvas_count = canvas_tokens.shape[1]
+        decoded_latents = decoder_tokens[:, :latent_count]
+        decoded_canvas = decoder_tokens[:, latent_count : latent_count + canvas_count]
+        cursor_slice = decoder_tokens[:, latent_count + canvas_count :]
 
-        policy_logits = nn.Dense(
-            self.policy_dim,
-            dtype=jnp.float32,
-            kernel_init=nn.initializers.xavier_uniform(),
-            name="policy_head",
-        )(decoded_canvas.astype(self.dtype))
+        if self.policy_from_cursor_token:
+            if not self.use_cursor_token or cursor_slice.shape[1] == 0:
+                raise ValueError("Cursor token is required when policy_from_cursor_token is True")
+            policy_input = cursor_slice[:, 0, :]
+            policy_logits = nn.Dense(
+                self.policy_dim,
+                dtype=jnp.float32,
+                kernel_init=nn.initializers.xavier_uniform(),
+                name="policy_head_cursor",
+            )(policy_input.astype(self.dtype))
+        else:
+            policy_logits = nn.Dense(
+                self.policy_dim,
+                dtype=jnp.float32,
+                kernel_init=nn.initializers.xavier_uniform(),
+                name="policy_head_canvas",
+            )(decoded_canvas.astype(self.dtype))
 
         value_tokens = decoded_latents.mean(axis=1)
         value = nn.Dense(

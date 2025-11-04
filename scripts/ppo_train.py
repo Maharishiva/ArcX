@@ -52,8 +52,7 @@ class RolloutBatch(NamedTuple):
 class TaskCache(NamedTuple):
     grids: jnp.ndarray
     grid_ids: jnp.ndarray
-    tokens: jnp.ndarray
-    pos: jnp.ndarray
+    latents: jnp.ndarray
     mask: jnp.ndarray
 
 
@@ -86,16 +85,6 @@ class PPOConfig:
     wandb_run_name: Optional[str] = None
     wandb_mode: str = "disabled"
     wandb_tags: Optional[Tuple[str, ...]] = None
-
-
-def select_cursor_logits(canvas_logits: jnp.ndarray, cursor: jnp.ndarray, grid_size: int) -> jnp.ndarray:
-    """Gather the logits for the cursor locations."""
-    idx = cursor[:, 0] * grid_size + cursor[:, 1]
-    idx = idx[:, None, None]
-    picked = jnp.take_along_axis(canvas_logits, idx, axis=1)
-    return picked[:, 0, :]
-
-
 def build_extra_canvas_features(
     cursor: jnp.ndarray,
     last_action: jnp.ndarray,
@@ -104,8 +93,8 @@ def build_extra_canvas_features(
     grid_size: int,
     num_actions: int,
     max_steps: int,
-) -> jnp.ndarray:
-    """Construct per-cell conditioning features for the current canvas."""
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Construct per-cell canvas features plus cursor-token conditioning."""
     cursor_y = jnp.clip(cursor[:, 0], 0, grid_size - 1)
     cursor_x = jnp.clip(cursor[:, 1], 0, grid_size - 1)
 
@@ -136,7 +125,22 @@ def build_extra_canvas_features(
         (cursor.shape[0], grid_size, grid_size, 1),
     )
 
-    return jnp.concatenate([cursor_mask, last_action_feat, selected_color_feat, time_feat], axis=-1)
+    per_cell = jnp.concatenate([cursor_mask, last_action_feat, selected_color_feat, time_feat], axis=-1)
+
+    cursor_norm = jnp.stack([cursor_y, cursor_x], axis=-1).astype(jnp.float32)
+    cursor_norm = cursor_norm / jnp.maximum(grid_size - 1.0, 1.0)
+    cursor_token = jnp.concatenate(
+        [
+            cursor_norm,
+            last_action_one_hot,
+            selected_color[:, None].astype(jnp.float32) / 9.0,
+            time_remaining[:, None],
+        ],
+        axis=-1,
+    )
+
+    cursor_pos = jnp.stack([cursor_y.astype(jnp.float32), cursor_x.astype(jnp.float32)], axis=-1)
+    return per_cell, cursor_token, cursor_pos
 
 
 def compute_gae(
@@ -172,17 +176,33 @@ def flatten_batch(x: jnp.ndarray) -> jnp.ndarray:
     return x.reshape(new_shape)
 
 
-def make_task_cache_fn(model_apply, env):
+def downsample_token_mask(mask: jnp.ndarray, grid_size: int, patch_size: int) -> jnp.ndarray:
+    if patch_size <= 1:
+        return mask
+    cells_per_grid = grid_size * grid_size
+    num_grids = mask.shape[-1] // cells_per_grid
+    rows = grid_size // patch_size
+    cols = grid_size // patch_size
+    reshaped = mask.reshape(mask.shape[0], 1, 1, num_grids, rows, patch_size, cols, patch_size)
+    reshaped = jnp.any(reshaped, axis=-1)
+    reshaped = jnp.any(reshaped, axis=-2)
+    return reshaped.reshape(mask.shape[0], 1, 1, num_grids * rows * cols)
+
+
+def make_task_cache_fn(model_apply, env, task_patch_size: int):
     @jax.jit
     def cache_fn(params: Dict[str, jnp.ndarray], problem_indices: jnp.ndarray):
         task_grids, grid_ids, token_mask = env.build_context_batch(problem_indices)
-        tokens, pos = model_apply(
+        patch_mask = downsample_token_mask(token_mask, env.GRID_SIZE, task_patch_size)
+        latents = model_apply(
             {"params": params},
             task_grids,
             grid_ids,
-            method=PerceiverActorCritic.prepare_task_cache,
+            task_mask=patch_mask,
+            deterministic=True,
+            method=PerceiverActorCritic.prepare_task_latents,
         )
-        return TaskCache(task_grids, grid_ids, tokens, pos, token_mask)
+        return TaskCache(task_grids, grid_ids, latents, patch_mask)
 
     return cache_fn
 
@@ -200,7 +220,7 @@ def make_rollout_fn(
         state: ARCEnvState,
         cache: TaskCache,
     ):
-        extra_feats = build_extra_canvas_features(
+        grid_feats, cursor_feats, cursor_pos = build_extra_canvas_features(
             state.cursor,
             state.last_action,
             state.selected_color,
@@ -209,21 +229,22 @@ def make_rollout_fn(
             num_actions,
             max_steps,
         )
+        cached_latents = jax.lax.stop_gradient(cache.latents)
         outputs = model_apply(
             {"params": params},
             cache.grids,
             cache.grid_ids,
             state.canvas,
-            extra_feats,
-            cached_task_tokens=cache.tokens,
-            cached_task_pos=cache.pos,
-            cached_task_mask=cache.mask,
+            grid_feats,
+            cursor_token_feats=cursor_feats,
+            cursor_positions=cursor_pos,
+            cached_task_latents=cached_latents,
             deterministic=True,
         )
-        cursor_logits = select_cursor_logits(outputs["logits"], state.cursor, grid_size)
-        log_probs_all = jax.nn.log_softmax(cursor_logits, axis=-1)
+        log_probs_all = jax.nn.log_softmax(outputs["logits"], axis=-1)
         return log_probs_all, outputs["value"]
 
+    @jax.jit
     def policy_step(
         params: Dict[str, jnp.ndarray],
         rng_key: jax.Array,
@@ -232,18 +253,6 @@ def make_rollout_fn(
     ):
         log_probs_all, values = policy_forward(params, state, cache)
         actions = jax.random.categorical(rng_key, log_probs_all, axis=-1).astype(jnp.int32)
-        idx = jnp.arange(actions.shape[0])
-        log_probs = log_probs_all[idx, actions]
-        return actions, log_probs, values
-
-    @jax.jit
-    def policy_step_greedy(
-        params: Dict[str, jnp.ndarray],
-        state: ARCEnvState,
-        cache: TaskCache,
-    ):
-        log_probs_all, values = policy_forward(params, state, cache)
-        actions = jnp.argmax(log_probs_all, axis=-1).astype(jnp.int32)
         idx = jnp.arange(actions.shape[0])
         log_probs = log_probs_all[idx, actions]
         return actions, log_probs, values
@@ -285,7 +294,7 @@ def make_rollout_fn(
         )
         return final_state, RolloutBatch(*trajectory), final_key
 
-    return rollout, policy_step_greedy
+    return rollout, policy_step
 
 
 def make_value_fn(
@@ -300,7 +309,7 @@ def make_value_fn(
         state: ARCEnvState,
         cache: TaskCache,
     ) -> jnp.ndarray:
-        extra_feats = build_extra_canvas_features(
+        grid_feats, cursor_feats, cursor_pos = build_extra_canvas_features(
             state.cursor,
             state.last_action,
             state.selected_color,
@@ -309,15 +318,16 @@ def make_value_fn(
             num_actions,
             max_steps,
         )
+        cached_latents = jax.lax.stop_gradient(cache.latents)
         outputs = model_apply(
             {"params": params},
             cache.grids,
             cache.grid_ids,
             state.canvas,
-            extra_feats,
-            cached_task_tokens=cache.tokens,
-            cached_task_pos=cache.pos,
-            cached_task_mask=cache.mask,
+            grid_feats,
+            cursor_token_feats=cursor_feats,
+            cursor_positions=cursor_pos,
+            cached_task_latents=cached_latents,
             deterministic=True,
         )
         return outputs["value"]
@@ -343,66 +353,77 @@ def make_ppo_update_fn(
     if steps_per_minibatch == 0:
         raise ValueError("num_minibatches cannot exceed rollout_length when avoiding cache duplication.")
 
-    def loss_fn(params, batch, cache: TaskCache):
+    def loss_fn(params, minibatch, cache: TaskCache):
         metric_keys = ("loss", "policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction")
-        init_metrics = {k: jnp.zeros((), dtype=jnp.float32) for k in metric_keys}
 
-        def timestep_loss(carry, data):
-            metrics_acc = carry
-            extra_feats = build_extra_canvas_features(
-                data["cursor"],
-                data["last_action"],
-                data["selected_color"],
-                data["steps"],
-                grid_size,
-                num_actions,
-                max_steps,
-            )
-            outputs = model_apply(
-                {"params": params},
-                cache.grids,
-                cache.grid_ids,
-                data["canvas"],
-                extra_feats,
-                cached_task_tokens=cache.tokens,
-                cached_task_pos=cache.pos,
-                cached_task_mask=cache.mask,
-                deterministic=False,
-            )
-            cursor_logits = select_cursor_logits(outputs["logits"], data["cursor"], grid_size)
-            log_probs_all = jax.nn.log_softmax(cursor_logits, axis=-1)
-            idx = jnp.arange(cursor_logits.shape[0])
-            new_log_probs = log_probs_all[idx, data["actions"]]
+        task_latents = model_apply(
+            {"params": params},
+            cache.grids,
+            cache.grid_ids,
+            task_mask=cache.mask,
+            deterministic=False,
+            method=PerceiverActorCritic.prepare_task_latents,
+        )
 
-            ratios = jnp.exp(new_log_probs - data["old_log_probs"])
-            clipped = jnp.clip(ratios, 1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon)
-            policy_loss = -jnp.mean(
-                jnp.minimum(ratios * data["advantages"], clipped * data["advantages"])
-            )
+        flat_canvas = minibatch["canvas"].reshape(-1, grid_size, grid_size)
+        flat_cursor = minibatch["cursor"].reshape(-1, 2)
+        flat_last_action = minibatch["last_action"].reshape(-1)
+        flat_selected = minibatch["selected_color"].reshape(-1)
+        flat_steps = minibatch["steps"].reshape(-1)
+        flat_actions = minibatch["actions"].reshape(-1)
+        flat_old_log_probs = minibatch["old_log_probs"].reshape(-1)
+        flat_advantages = minibatch["advantages"].reshape(-1)
+        flat_returns = minibatch["returns"].reshape(-1)
+        env_ids = minibatch["env_id"].reshape(-1)
 
-            values = outputs["value"]
-            value_loss = 0.5 * jnp.mean((values - data["returns"]) ** 2)
+        grid_feats, cursor_feats, cursor_pos = build_extra_canvas_features(
+            flat_cursor,
+            flat_last_action,
+            flat_selected,
+            flat_steps,
+            grid_size,
+            num_actions,
+            max_steps,
+        )
 
-            entropy = -jnp.mean(jnp.sum(jnp.exp(log_probs_all) * log_probs_all, axis=-1))
-            approx_kl = jnp.mean(data["old_log_probs"] - new_log_probs)
-            clip_fraction = jnp.mean((jnp.abs(ratios - 1.0) > config.clip_epsilon).astype(jnp.float32))
+        sample_latents = jnp.take(task_latents, env_ids, axis=0)
+        outputs = model_apply(
+            {"params": params},
+            None,
+            None,
+            flat_canvas,
+            grid_feats,
+            cursor_token_feats=cursor_feats,
+            cursor_positions=cursor_pos,
+            cached_task_latents=sample_latents,
+            deterministic=False,
+        )
 
-            total_loss = policy_loss + config.value_coef * value_loss - config.entropy_coef * entropy
-            metrics = {
-                "loss": total_loss,
-                "policy_loss": policy_loss,
-                "value_loss": value_loss,
-                "entropy": entropy,
-                "approx_kl": approx_kl,
-                "clip_fraction": clip_fraction,
-            }
-            metrics_acc = {k: metrics_acc[k] + metrics[k] for k in metric_keys}
-            return metrics_acc, None
+        logits = outputs["logits"]
+        values = outputs["value"].reshape(flat_returns.shape)
+        log_probs_all = jax.nn.log_softmax(logits, axis=-1)
+        idx = jnp.arange(logits.shape[0])
+        new_log_probs = log_probs_all[idx, flat_actions]
 
-        metrics_sum, _ = jax.lax.scan(timestep_loss, init_metrics, batch)
-        num_steps = jnp.array(batch["advantages"].shape[0], dtype=jnp.float32)
-        metrics_avg = {k: v / num_steps for k, v in metrics_sum.items()}
-        return metrics_avg["loss"], metrics_avg
+        ratios = jnp.exp(new_log_probs - flat_old_log_probs)
+        clipped = jnp.clip(ratios, 1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon)
+        policy_loss = -jnp.mean(jnp.minimum(ratios * flat_advantages, clipped * flat_advantages))
+
+        value_loss = 0.5 * jnp.mean((values - flat_returns) ** 2)
+        entropy = -jnp.mean(jnp.sum(jnp.exp(log_probs_all) * log_probs_all, axis=-1))
+        approx_kl = jnp.mean(flat_old_log_probs - new_log_probs)
+        clip_fraction = jnp.mean((jnp.abs(ratios - 1.0) > config.clip_epsilon).astype(jnp.float32))
+
+        total_loss = policy_loss + config.value_coef * value_loss - config.entropy_coef * entropy
+        metrics = {
+            "loss": total_loss,
+            "policy_loss": policy_loss,
+            "value_loss": value_loss,
+            "entropy": entropy,
+            "approx_kl": approx_kl,
+            "clip_fraction": clip_fraction,
+        }
+        return total_loss, metrics
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
 
@@ -500,7 +521,7 @@ def summarize_env_batch(env, state: ARCEnvState, episode_returns: jnp.ndarray) -
 def evaluate_policy(
     params: Dict[str, jnp.ndarray],
     env,
-    policy_step_greedy,
+    policy_step_sample,
     task_cache_fn,
     config: PPOConfig,
     rng: jax.Array,
@@ -512,7 +533,8 @@ def evaluate_policy(
         returns = jnp.zeros((config.eval_envs,), dtype=jnp.float32)
 
         for _ in range(config.eval_horizon):
-            actions, _, _ = policy_step_greedy(params, state, cache)
+            rng_key, step_key = jax.random.split(rng_key)
+            actions, _, _ = policy_step_sample(params, step_key, state, cache)
             state, rewards, dones = env.env_step_batch(state, actions)
             returns = returns + rewards
             if bool(jnp.all(dones)):
@@ -687,8 +709,9 @@ def main():
     state = env.env_reset_batch(reset_key, train=True, batch_size=config.num_envs)
 
     task_grids, grid_ids, init_mask = env.build_context_batch(state.problem_idx)
+    init_mask_patch = downsample_token_mask(init_mask, grid_size, model.task_patch_size)
 
-    init_extra_feats = build_extra_canvas_features(
+    init_grid_feats, init_cursor_feats, init_cursor_pos = build_extra_canvas_features(
         state.cursor,
         state.last_action,
         state.selected_color,
@@ -704,8 +727,10 @@ def main():
         task_grids,
         grid_ids,
         state.canvas,
-        init_extra_feats,
-        task_mask=init_mask,
+        init_grid_feats,
+        cursor_token_feats=init_cursor_feats,
+        cursor_positions=init_cursor_pos,
+        task_mask=init_mask_patch,
     )
 
     if config.max_grad_norm is not None:
@@ -714,10 +739,10 @@ def main():
         tx = optax.adam(config.learning_rate)
     train_state = TrainState.create(apply_fn=model.apply, params=params["params"], tx=tx)
 
-    rollout_fn, policy_step_greedy = make_rollout_fn(model.apply, env, config, grid_size, num_actions, max_steps)
+    rollout_fn, policy_step_fn = make_rollout_fn(model.apply, env, config, grid_size, num_actions, max_steps)
     value_fn = make_value_fn(model.apply, grid_size, num_actions, max_steps)
     ppo_update_fn = make_ppo_update_fn(model.apply, config, grid_size, num_actions, max_steps)
-    task_cache_fn = make_task_cache_fn(model.apply, env)
+    task_cache_fn = make_task_cache_fn(model.apply, env, model.task_patch_size)
 
     param_count = sum(int(x.size) for x in tree_util.tree_leaves(train_state.params))
     print(
@@ -766,6 +791,7 @@ def main():
             "old_log_probs": traj.log_probs,
             "advantages": advantages,
             "returns": returns,
+            "env_id": traj.env_id,
         }
 
         rng, update_key = jax.random.split(rng)
@@ -817,7 +843,7 @@ def main():
             rng, eval_metrics = evaluate_policy(
                 train_state.params,
                 env,
-                policy_step_greedy,
+                policy_step_fn,
                 task_cache_fn,
                 config,
                 rng,
